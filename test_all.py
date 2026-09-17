@@ -4,6 +4,7 @@
 redak, indeks sa svim stupcima, --only načini."""
 import json
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,10 +24,9 @@ def check(name, cond, extra=""):
         FAILURES.append(name)
 
 
-OUT = Path("/home/claude/build/test_all_out")
+OUT = Path(tempfile.mkdtemp(prefix="liberiq_test_all_"))
 import shutil
-shutil.rmtree(OUT, ignore_errors=True)
-(OUT / "pdp").mkdir(parents=True)
+(OUT / "pdp").mkdir(parents=True, exist_ok=True)
 CACHE = OUT / ".cache" / "html"
 
 PROD = P.Product("Kozmetika", "La Roche-Posay", "TST1",
@@ -166,6 +166,8 @@ jl = OUT / "results.jsonl"
 jl.write_text(json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8")
 done = A.load_done(jl)
 check("resume: redak učitan po SKU", done.get("TST1", {}).get("Ukupni status") == "OK")
+
+shutil.rmtree(OUT, ignore_errors=True)
 
 print()
 if FAILURES:

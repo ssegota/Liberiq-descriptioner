@@ -4,6 +4,7 @@
 po-kategorijske napomene, placeholderi, otpornost na greške."""
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import prompts_cfg
@@ -19,7 +20,8 @@ def check(name, cond, extra=""):
         FAILURES.append(name)
 
 
-DIR = Path("/home/claude/build/test_prompts")
+TMP = Path(tempfile.mkdtemp(prefix="liberiq_test_prompts_"))
+DIR = TMP / "prompts"
 shutil.rmtree(DIR, ignore_errors=True)
 
 # 1. Bez mape -> ugrađeni promptovi
@@ -146,7 +148,7 @@ class Mock:
 res, md = P.process_product(prod, "cosmetics", src, Mock(), 2, True)
 check("pipeline: radi s vanjskim napomenama", res.status == "OK", f"({res.status})")
 
-shutil.rmtree(DIR, ignore_errors=True)
+shutil.rmtree(TMP, ignore_errors=True)
 prompts_cfg.set_dir(Path("prompts"))
 
 print()
