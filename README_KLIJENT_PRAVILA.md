@@ -1,85 +1,90 @@
-# Provedba klijentovih uputa nakon testiranja
+# Provedba klijentovih pravila
 
-Sve niže navedeno ugrađeno je kao **default u kodu** (promptovi + deterministički
-validatori), ne kao opcionalna napomena. Datoteke u `prompts/` ostaju za buduće
-sitne dopune i dodaju se povrh ovih pravila.
+Izvori: *Pravila meta opis i title tag eljekarna24*, *PDP struktura* s četiri
+predloška, *Audit title, meta opis i PDP* i *Upute za generator* (21. 9. 2026.).
+Sve je ugrađeno kao default u kodu; datoteke u `prompts/` služe za dopune.
 
-## A. Title tag i meta opis (eljekarna24_title_meta_uputa.docx)
+## Z. Zajednička pravila
 
-| Klijentovo pravilo | Gdje je provedeno |
+| Pravilo | Provedba |
 | --- | --- |
-| Separator `\|` (U+007C), nikad `│` (U+2502) | `BRAND_SUFFIX` |
-| Nastavak `\| eljekarna24` samo ako stane u 550 px | `finalize_title()` |
-| Količina se NIKAD ne uklanja pri skraćivanju | `trim_title_to_px(keep_qty=…)` — skraćuje sredinu, čuva rep s količinom; validator odbija title bez količine |
-| Bez zareza ispred količine | `COMMA_BEFORE_QTY_RE` |
-| Jedinica punom riječju (100 tableta, ne 100 tab) | `UNIT_ABBREV_RE` |
-| Razmak između broja i jedinice (75 ml) | `NO_SPACE_UNIT_RE` |
-| Title počinje **generiranim** nazivom iz PDP-a | `canonical_name` — runner vadi naziv iz PDP-a i prosljeđuje ga SEO-u |
-| Namjena u meti je OBVEZNA | `PURPOSE_RE`; ako se ne može potvrditi → `namjena_potvrdjena=false` → **TREBA PROVJERA**, namjena se ne izmišlja |
-| Bez superlativa (idealan, idealno…) | prošireni `FORBIDDEN_PATTERNS` |
-| Jedinstven title i meta po URL-u | provjera duplikata kroz cijeli skup |
-| Izvor 1 = eljekarna24 (obvezan) | bez stranice → status **GREŠKA** |
-| Izvor 2 = službena stranica brenda, svaki podatak označen | `BrandSource`; stupci *Izvor – brend*, *Preuzeto s brend stranice*, *Napomena za provjeru*; redak ide u TREBA PROVJERA |
-| Nikad treći izvori (forumi, konkurenti, tražilice) | `brand_source_for()` prihvaća samo domenu brenda |
+| **Z1 Hijerarhija izvora** | `pravila.py`: allowlist domena. Izvor 1 je stranica proizvoda na eljekarna24, izvor 2 je službena hrvatska stranica brenda. Sve ostalo (druge ljekarne, tražilice, marketplace, strana tržišta) odbacuje se prije slanja modelu. Provjera je u kodu, ne u promptu. |
+| **Z2 Spremno za copy/paste** | `nadi_interne_napomene()` odbija `[S1]`, „KONFLIKT“, „potvrditi“, „provjeriti“, „Prije lokalne objave“, „prema dostupnoj dokumentaciji“ i spominjanje drugih trgovina. Model te podatke vraća u završnom JSON-u, koji se odvaja od dokumenta i ide u internu datoteku. |
+| **Z3 Bez uspoređivanja šifri** | Šifre drugih trgovina nisu izvor, pa lažni konflikti SKU-a više ne nastaju. |
+| **Z4 Bez crtica** | `ukloni_crtice()` mijenja – i — zarezom ili točkom, radi po retcima pa struktura ostaje. Rasponi brojeva (22–42 cm, 6–12 mjeseci) i crtice u nazivima ostaju. |
 
-Novi stupci: **Namjena**, **Izvor – eljekarna24**, **Izvor – brend**,
-**Preuzeto s brend stranice**, **Napomena za provjeru**.
+## Title tag
 
-## B. PDP opisi (eljekarna24_PDP_opisi_uputa_nakon_testiranja.docx)
+- Gradi se iz generiranog PDP naziva, samo riječi iz njega, istim redoslijedom
+  (validator odbija riječi kojih ondje nema).
+- Uvijek ostaju brend, linija, tip, varijanta (nijansa, SPF, Riche, jakost) i
+  količina s jedinicom (`obavezni_pojmovi()`).
+- Skraćivanje ide po cijelim segmentima (`skrati_po_segmentima()`): prvo namjena
+  iza crtice ili zareza, zatim opći pridjevi, zatim sporedne značajke. Fraza se
+  nikad ne reže na pola.
+- Ne završava prijedlogom, veznikom, znakom ni brojem bez jedinice.
+- Bez zareza ispred količine, razmak između broja i jedinice, bez crtica.
+- Nastavak ` | eljekarna24` (U+007C) dodaje kod, samo ako sve stane u 550 px.
 
-Novi tok: `SOURCE → STRUKTURIRANA EKSTRAKCIJA → PISAC → KONTROLA FORMATA →
-FACT-CHECK → COVERAGE CHECK`.
+## Meta opis
 
-- **Ekstrakcija prije pisanja** (`pdp_extract.py`): zaseban poziv modelu gradi
-  inventar činjenica — vrijednost + izvor + status (FOUND / NOT FOUND /
-  DERIVED / CONFLICT), po kategorijskim popisima polja iz upute.
-- **Hard fields** (doza, puni sastav/INCI, aktivne tvari i koncentracije, način
-  uporabe, upozorenja, identifikatori, specifikacije, dobna faza) ne smiju
-  nestati ni biti skraćeni; pisac ih dobiva označene u promptu.
-- **Coverage check** nakon pisanja uspoređuje inventar s finalnim PDP-om i
-  vraća pisca na dopunu ako je podatak izgubljen ili zamijenjen placeholderom.
-- **Puni INCI/sastav** prenosi se doslovno kada je pronađen (uvodi se s „INCI:“
-  / „Sastav:“); propisani placeholder samo kada podatak stvarno ne postoji.
-- **Konflikt izvora** se ne spaja i ne rješava samovoljno → status
-  **CONFLICT / REVIEW**.
+- Prva rečenica: naziv bez količine, namjena, količina. Druga rečenica: jedna
+  ili dvije specifikacije iz dopuštenih izvora.
+- Namjena unutar prvih 100 znakova, obvezna.
+- Količina samo jednom; „Pakiranje od“, „Volumen“, „Dostupno u“ se odbijaju.
+- Mora sadržavati brend iz titla; količina mora biti ista u PDP nazivu, titlu i
+  meta opisu.
+- Najviše 960 px, bez CTA-a, cijene, zalihe, dostave i crtica.
+- Tvrdnje po kategoriji: dodaci prehrani samo odobrene tvrdnje doslovno iz
+  izvora; hrana za dojenčad samo namjena i dob; medicinski proizvodi samo
+  tvrdnje iz upute; kozmetika doslovno iz izvora.
 
-Novi statusi: **NEDOSTAJE PODATAK IZ IZVORA**, **CONFLICT / REVIEW**,
-**GREŠKA EKSTRAKCIJE** (uz OK i TREBA PROVJERA).
-Novi stupci: **Ekstrahiranih polja**, **Coverage check**, **Konflikt izvora**.
+## PDP
 
-Web pretraga za PDP ostaje (klijent je izričito ne ukida) — za SEO ostaje samo
-eljekarna24 + službeni brend.
+- **Brzi podaci:** šest popunjenih polja (tip proizvoda, namjena, ciljana
+  skupina, područje primjene, tekstura/oblik, pakiranje). Uputa iz predloška
+  nikad ne ostaje u izlazu; validator hvata prazna polja.
+- **Sastojci:** točno 3 ili 4 istaknuta, zatim puni sastav ili INCI doslovno.
+  Nutritivna tablica ide zasebno.
+- **Obvezni podaci:** EAN, proizvođač i pakiranje. Ako ih nema, ostaje tekst iz
+  predloška, a status je TREBA PROVJERA.
+- **Kliničke studije:** svaki redak mora imati rezultat, vrijeme, broj
+  ispitanika, metodu i izvor, inače se izostavlja cijeli blok.
+- **Zabranjene formulacije:** „klinički dokazano“, „testirano“, „dermatološki
+  testirano“ bez objašnjenja što je i kako testirano.
+- **Hrana za dojenčad:** obvezna rečenica „Dojenje je najbolji način prehrane
+  dojenčeta.“; početna hrana bez prehrambenih i zdravstvenih tvrdnji.
+- **Naziv:** Brend + naziv + glavna karakteristika + količina na kraju, bez
+  crtice, bez znaka |, bez namjene u nazivu.
 
-Nove zastavice: `--no-extract`, `--no-coverage` (za dijagnostiku; u normalnom
-radu se ne koriste).
+## Statusi
 
-## C. Hijerarhija izvora (naknadna uputa)
+| Status | Kada |
+| --- | --- |
+| OK | Validator nema nijednu napomenu. |
+| TREBA PROVJERA | Nakon 3 pokušaja i dalje ima napomena, nedostaje obvezan podatak (EAN, proizvođač, puni sastav) ili je korišten izvor 2. |
+| GREŠKA | Stranica eljekarna24 nije dohvaćena. Ne generira se ni SEO ni PDP. |
 
-| Prioritet | Izvor | Kako se koristi |
-| --- | --- | --- |
-| **1** | Stranica proizvoda s linka iz ulazne tablice | Uvijek prvo. Kad podatak postoji ondje, koristi se ta vrijednost. |
-| **2** | `webljekarna.vasezdravlje.com` (zadani sekundarni izvor) | Samo za podatke kojih nema na prioritetu 1. Traži se `site:` pretragom po brendu i nazivu. |
-| **3** | Ostali web izvori (službena stranica brenda i dr.) | Tek kad podatka nema ni na 1 ni na 2. |
+Statusi „OK (skraćeno)“ i „CONFLICT / REVIEW“ su ukinuti.
 
-Prioritet određuje **koja se vrijednost koristi**, ali ako izvori daju različitu
-konkretnu vrijednost, konflikt se i dalje označava (**CONFLICT / REVIEW**) i ne
-rješava se samovoljnim odabirom ili spajanjem.
+## Izlazne datoteke
 
-Za SEO (title/meta) vrijedi ista hijerarhija, ali se koriste samo prioriteti
-1–2 te službena stranica brenda; forumi, konkurentski webshopovi i tražilice
-ne. Korišteni sekundarni izvor upisuje se u stupce *Izvor – brend* /
-*Preuzeto s brend stranice*, a redak dobiva *Napomena za provjeru*.
+- `title_meta_za_klijenta.xlsx` (+ .csv): Sekcija, Brend, SKU, Naziv, URL,
+  Title tag, Title (px), Meta opis, Meta opis (px). Bez internih stupaca.
+- `interno.xlsx` (+ .csv): Status, Izvor – eljekarna24, Izvor – brend, Preuzeto
+  s brend stranice, Nedostaje, Konflikti, Napomena validatora, PDP status,
+  putanja PDP datoteke, trajanje, model.
+- `pdp/PDP_<SKU>_<naziv>.docx` i `.md`: jedan dokument po proizvodu, čist za
+  copy/paste.
+- `sadrzaj_indeks.xlsx`: puni tehnički indeks (ostaje za dijagnostiku).
 
-Isključivanje: `--no-secondary`.
+## Održavanje allowliste
 
-## D. Definitivni izrazi
+Domene po brendu su u `pravila.py`, rječnik `BREND_DOMENE`. Dodavanje novog
+brenda je jedan redak. Rječnik zapisa brendova i linija je `RJECNIK_ZAPISA`.
 
-Zabranjeni u oba alata (prompt + deterministička kontrola) osim ako su doslovno
-potvrđeni u izvorima uz metodu ili mjerenje: *najbolji, najučinkovitiji,
-najsigurniji, najnježniji, najpopularniji, najprodavaniji, jedini, nema premca,
-zlatni standard, prvi izbor, apsolutno, uvijek djeluje, svima odgovara, bez
-iznimke, trenutni rezultati, bez ikakvih nuspojava, potpuno bezopasan,
-idealan/idealno, savršen, vrhunski*, plus opći uzorak `naj…iji`.
+## Otvorena pitanja za klijenta
 
-Iznimke: obvezne zakonske rečenice (npr. „Dojenje je najbolji način prehrane
-dojenčeta.“) i mjerni izrazi (*najviše, najmanje, najkasnije, najranije*).
+Zarez ispred količine u PDP nazivu, zapis naziva linija (RC 01, UreaRepair,
+UVMUNE), tvrdnje za prijelaznu formulu i mlijeko za malu djecu, izvor EAN-a i
+proizvođača (PIM ili stranica eljekarna24).

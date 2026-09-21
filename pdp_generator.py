@@ -59,6 +59,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import pdp_extract as X
+import pravila as R
 import pdp_templates as T
 import prompts_cfg
 
@@ -88,8 +89,7 @@ USER_AGENT = (
 #   prioritet 2 — zadani sekundarni izvor (webljekarna.vasezdravlje.com)
 #   prioritet 3 — svi ostali web izvori
 PRIMARY_DOMAIN = "eljekarna24"
-SECONDARY_DOMAIN = "webljekarna.vasezdravlje.com"
-SECONDARY_LABEL = "zadani sekundarni izvor"
+SECONDARY_LABEL = "službena stranica brenda"
 
 CATEGORY_QUERY_EXTRA = {
     "cosmetics": "sastav INCI",
@@ -273,6 +273,7 @@ class RowResult:
     inventory: object = None
     coverage: list = field(default_factory=list)
     conflicts: list = field(default_factory=list)
+    nedostaje: list = field(default_factory=list)
 
     def to_record(self) -> dict:
         return {
@@ -291,6 +292,7 @@ class RowResult:
             "Coverage check": ("prolazi" if not self.coverage else
                                " | ".join(self.coverage[:4])),
             "Konflikt izvora": " | ".join(self.conflicts),
+            "Nedostaje": " | ".join(self.nedostaje),
             "Broj izvora": len(self.sources),
             "Izvori": " | ".join(s.url for s in self.sources),
             "MD datoteka": self.md_path,
@@ -441,7 +443,7 @@ def web_search_urls(product: Product, category: str, max_urls: int) -> list[dict
                     if not href.startswith("http"):
                         continue
                     host = urlparse(href).netloc.lower()
-                    if (PRIMARY_DOMAIN in host or SECONDARY_DOMAIN in host
+                    if (PRIMARY_DOMAIN in host
                             or href.lower().endswith(".pdf")):
                         continue
                     score = 1 + sum(2 for tok in brand_tokens if tok in
@@ -457,6 +459,19 @@ def web_search_urls(product: Product, category: str, max_urls: int) -> list[dict
 
     ranked = sorted(results.values(), key=lambda r: -r["score"])
     return ranked[:max_urls]
+
+
+def brand_site_urls(product: Product, max_urls: int = 2) -> list[str]:
+    """Stranice proizvoda na SLUŽBENIM hrvatskim domenama brenda (allowlist)."""
+    domene = [d for d in R.dopustene_domene(product.brend) if d != R.PRIMARNA_DOMENA]
+    nadjeno: list[str] = []
+    for domena in domene:
+        url = site_search_url(product, domena)
+        if url and R.je_dopusten(url, product.brend)[0]:
+            nadjeno.append(url)
+        if len(nadjeno) >= max_urls:
+            break
+    return nadjeno
 
 
 def site_search_url(product: Product, domain: str) -> str | None:
@@ -484,45 +499,41 @@ def site_search_url(product: Product, domain: str) -> str | None:
 def gather_sources(product: Product, category: str, cache_dir: Path,
                    refresh: bool, web_search: bool, max_web: int,
                    secondary: bool = True) -> list[Source]:
+    """Izvori prema hijerarhiji iz uputa, provedenoj u kodu (allowlist domena):
+       1. stranica proizvoda na eljekarna24 (URL iz ulazne tablice),
+       2. službena hrvatska stranica brenda, samo za podatke kojih nema na 1.
+    Sve ostalo se odbacuje prije slanja modelu."""
     sources: list[Source] = []
 
-    # --- PRIORITET 1: stranica proizvoda s linka iz ulazne tablice ---
+    # --- izvor 1 ---
+    if not R.je_primarni(product.url):
+        return sources
     html = _cache_get_or_fetch(product.url, cache_dir, refresh)
     if html:
         text = extract_product_page(html)
         if text:
             sources.append(Source(sid="S1", kind="stranica proizvoda",
                                   url=product.url, title="eljekarna24", text=text))
+    if not sources:
+        return sources
 
-    # --- PRIORITET 2: zadani sekundarni izvor ---
+    # --- izvor 2: samo službena hrvatska stranica brenda ---
     if secondary and web_search:
-        sec_url = site_search_url(product, SECONDARY_DOMAIN)
-        if sec_url:
-            sec_html = _cache_get_or_fetch(sec_url, cache_dir, refresh)
-            if sec_html:
-                title, text = extract_generic_page(sec_html)
-                if len(text) >= 150:
-                    sources.append(Source(sid=f"S{len(sources) + 1}",
-                                          kind=SECONDARY_LABEL, url=sec_url,
-                                          title=title or SECONDARY_DOMAIN,
-                                          text=text))
-        time.sleep(0.3)
-
-    # --- PRIORITET 3: ostali web izvori ---
-    if web_search and max_web > 0:
-        for hit in web_search_urls(product, category, max_web):
-            html = _cache_get_or_fetch(hit["href"], cache_dir, refresh)
-            if not html:
+        for url in brand_site_urls(product):
+            dopusteno, _razlog = R.je_dopusten(url, product.brend)
+            if not dopusteno:
                 continue
-            title, text = extract_generic_page(html)
-            if len(text) < 200:
+            brand_html = _cache_get_or_fetch(url, cache_dir, refresh)
+            if not brand_html:
                 continue
-            sources.append(Source(sid=f"S{len(sources) + 1}", kind="web",
-                                  url=hit["href"],
-                                  title=title or hit.get("title", ""), text=text))
+            title, text = extract_generic_page(brand_html)
+            if len(text) < 150:
+                continue
+            sources.append(Source(sid=f"S{len(sources) + 1}", kind=SECONDARY_LABEL,
+                                  url=url, title=title or "stranica brenda",
+                                  text=text))
             time.sleep(0.3)
 
-    # re-numeriraj za svaki slučaj
     for i, src in enumerate(sources, start=1):
         src.sid = f"S{i}"
     return sources
@@ -538,11 +549,9 @@ def sources_block(sources: list[Source]) -> str:
         if s.kind == "stranica proizvoda":
             head = (f"[{s.sid}] PRIORITET 1 — STRANICA PROIZVODA (eljekarna24) "
                     f"— {s.url}")
-        elif s.kind == SECONDARY_LABEL:
-            head = (f"[{s.sid}] PRIORITET 2 — {SECONDARY_DOMAIN} "
-                    f"({SECONDARY_LABEL}) — {s.url}")
         else:
-            head = f"[{s.sid}] PRIORITET 3 — WEB — {s.title} — {s.url}"
+            head = (f"[{s.sid}] PRIORITET 2 — SLUŽBENA STRANICA BRENDA "
+                    f"— {s.url}")
         parts.append(f"{head}\n{s.text}")
     return "\n\n".join(parts)
 
@@ -700,6 +709,34 @@ provjerljiv podatak. Iznimka su obvezne zakonske rečenice (npr. "Dojenje je
 najbolji način prehrane dojenčeta.") i mjerni izrazi ("najviše", "najmanje",
 "najkasnije").
 
+PRAVILA IZLAZA (spremno za copy/paste)
+- U tekst za kupca NE piši oznake izvora ([S1], [S2]), riječi „KONFLIKT“,
+  „potvrditi“, „provjeriti koji je ispravan“, „Prije lokalne objave“, „prema
+  dostupnoj dokumentaciji“, nazive drugih trgovina ni njihove šifre.
+  Neslaganja i nedostatke vrati ISKLJUČIVO u završnom JSON-u.
+- Ne koristi crtice (– ili —). Umjesto njih zarez ili točka. Crtica ostaje samo
+  u rasponu brojeva (22–42 cm, 6–12 mjeseci) i unutar naziva (La Roche-Posay).
+- Šifre drugih trgovina se ne preuzimaju i ne uspoređuju; to nije konflikt.
+- Brza traka: popuni svih šest polja konkretnim podacima (Tip proizvoda,
+  Namjena, Ciljana skupina, Područje primjene, Tekstura / oblik, Pakiranje).
+  Uputa iz predloška nikad ne ostaje u izlazu.
+- Istaknuti sastojci: točno 3 ili 4, svaki s potvrđenom ulogom. Puni sastav ili
+  INCI ide doslovno ispod njih. Nutritivna tablica ide zasebno.
+- Kliničke studije: redak samo ako izvor navodi rezultat, vrijeme, broj
+  ispitanika, metodu i izvor. Inače IZOSTAVI cijeli blok.
+- Ne koristi „klinički dokazano“, „testirano“ ni „dermatološki testirano“ bez
+  objašnjenja što je i kako testirano.
+- Naziv proizvoda: Brend + naziv + glavna karakteristika + količina na kraju.
+  Bez crtice, bez znaka |, bez namjene u nazivu, bez zareza ispred količine.
+- Hrana za dojenčad: obvezna rečenica „Dojenje je najbolji način prehrane
+  dojenčeta.“ Početna hrana za dojenčad (0 do 6 mjeseci) bez prehrambenih i
+  zdravstvenih tvrdnji.
+
+NA KRAJU ODGOVORA, nakon dokumenta, u zasebnom bloku vrati JSON:
+```json
+{{"nedostaje": ["EAN", "..."], "konflikti": ["..."], "koristeni_izvori": ["..."]}}
+```
+
 MODEL NE SMIJE
 - Izbaciti pronađeni podatak zato što ga smatra manje važnim.
 - Zamijeniti postojeću vrijednost rečenicom tipa "provjeriti na pakiranju" ili
@@ -710,15 +747,14 @@ MODEL NE SMIJE
 - Puniti PDP generičkim tekstom na štetu konkretnih podataka proizvoda.
 - Koristiti činjenice iz formatnog primjera kategorije.
 
-HIJERARHIJA IZVORA (obvezna)
-- PRIORITET 1: stranica proizvoda s linka iz ulazne tablice. Kad podatak
-  postoji ondje, koristi se taj podatak.
-- PRIORITET 2: {SECONDARY_DOMAIN} — koristi se za podatke kojih nema na
-  prioritetu 1.
-- PRIORITET 3: ostali web izvori — tek kad podatka nema ni na 1 ni na 2.
-- Viši prioritet određuje KOJA se vrijednost koristi, ali ako izvori daju
-  RAZLIČITU konkretnu vrijednost, konflikt se svejedno vidljivo označava za
-  provjeru i ne rješava se samovoljno.
+HIJERARHIJA IZVORA (provodi se u kodu)
+- PRIORITET 1: stranica proizvoda na eljekarna24 (URL iz ulazne tablice).
+- PRIORITET 2: službena hrvatska stranica brenda, samo za podatak kojeg nema
+  na prioritetu 1.
+- Drugih izvora nema. Ako podatka nema ni u jednom od ta dva izvora, NE
+  izmišljaj ga: ostavi tekst iz predloška i navedi polje u listi "nedostaje".
+- Ako se konkretne vrijednosti razlikuju, NE spajaj ih i NE biraj sam:
+  neslaganje vrati isključivo u JSON polju "konflikti", nikad u tekstu.
 
 PRAVILA SADRŽAJA (apsolutna)
 1. ISKLJUČIVO ČINJENICE IZ IZVORA [S1..Sn], iz INVENTARA ili iz naziva
@@ -876,6 +912,35 @@ def parse_verifier_json(text: str) -> dict | None:
 HEADING_RE = re.compile(r"^(#{1,3})\s+(.*?)\s*$")
 
 
+JSON_BLOK_RE = re.compile(r"```json\s*(\{.*?\})\s*```\s*$", re.S)
+
+
+def odvoji_json_blok(raw: str) -> tuple[str, dict]:
+    """Izdvoji završni JSON (nedostaje / konflikti / koristeni_izvori) iz odgovora.
+    Dokument koji ide klijentu ostaje bez njega."""
+    m = JSON_BLOK_RE.search(raw or "")
+    podaci: dict = {}
+    if m:
+        try:
+            ucitano = json.loads(m.group(1))
+            if isinstance(ucitano, dict):
+                podaci = ucitano
+        except json.JSONDecodeError:
+            podaci = {}
+        raw = raw[:m.start()].rstrip()
+    else:
+        # model je vratio goli JSON na kraju, bez ograda
+        m2 = re.search(r"\n(\{\s*\"(?:nedostaje|konflikti|koristeni_izvori)\".*\})\s*$",
+                       raw or "", re.S)
+        if m2:
+            try:
+                podaci = json.loads(m2.group(1))
+            except json.JSONDecodeError:
+                podaci = {}
+            raw = raw[:m2.start()].rstrip()
+    return raw, podaci
+
+
 def clean_markdown(raw: str) -> str:
     text = re.sub(r"^```(?:markdown|md)?\s*|\s*```$", "", raw.strip(), flags=re.S)
     lines = text.splitlines()
@@ -1011,9 +1076,6 @@ def validate_pdp(md: str, product: Product, category: str,
             if h["title"] == "Brza traka ispod opisa":
                 body = block_of(md, headings, headings.index(h))
                 lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
-                if not lines or lines[0] != t["brza_traka"]:
-                    errors.append("Prva linija pod 'Brza traka ispod opisa' mora "
-                                  f"biti točno: \"{t['brza_traka']}\".")
                 bullets = [ln for ln in lines if ln.startswith("- ")]
                 if not 3 <= len(bullets) <= 4:
                     errors.append("Brza traka mora imati 3–4 natuknice ključnih "
@@ -1117,6 +1179,77 @@ def validate_pdp(md: str, product: Product, category: str,
     # --- Zabranjeni izrazi ---
     for hit in find_forbidden(md):
         errors.append(f"Zabranjeni izraz u dokumentu: {hit}.")
+    for hit in R.nadi_zabranjene_rijeci(md):
+        errors.append(f"Zabranjena riječ: {hit}.")
+
+    # --- Z2: interne napomene ne smiju u tekst za kupca ---
+    for hit in R.nadi_interne_napomene(md):
+        errors.append(f"Interna napomena u tekstu za kupca: {hit}. Takve podatke "
+                      "vrati samo u JSON poljima, nikad u dokumentu.")
+
+    # --- Z4: crtice ---
+    crtice = R.nadi_crtice(md)
+    if crtice:
+        errors.append(f"Dokument sadrži {len(crtice)} crtica (– ili —). Umjesto "
+                      "njih koristi zarez ili točku; crtica smije ostati samo u "
+                      "rasponu brojeva (22–42 cm).")
+
+    # --- tvrdnje „testirano“ bez objašnjenja ---
+    for hit in R.nadi_tvrdnje_bez_objasnjenja(md):
+        errors.append(f"Tvrdnja bez objašnjenja: {hit}.")
+
+    # --- brzi podaci: šest popunjenih polja ---
+    if sec1_pos is not None:
+        for h in headings:
+            if h["level"] == 3 and h["title"] == "Brza traka ispod opisa":
+                body = block_of(md, headings, headings.index(h))
+                for polje in T.BRZA_TRAKA_POLJA:
+                    red = re.search(rf"\|\s*{re.escape(polje)}\s*\|([^|]*)\|", body)
+                    if not red:
+                        errors.append(f"Brza traka nema polje „{polje}“. Obvezno je "
+                                      "svih šest polja.")
+                    elif len(red.group(1).strip()) < 2 or "{" in red.group(1):
+                        errors.append(f"Polje „{polje}“ u brzoj traci nije popunjeno "
+                                      "konkretnim podatkom iz izvora.")
+                break
+
+    # --- istaknuti sastojci: točno 3 ili 4 ---
+    sastojci_tab = {"cosmetics": 4, "supplement": 4, "formula": 3}.get(category)
+    if sastojci_tab and sastojci_tab in tab_blocks:
+        redovi = [ln for ln in tab_blocks[sastojci_tab].splitlines()
+                  if ln.strip().startswith("|") and "---" not in ln]
+        broj = max(0, len(redovi) - 1)          # bez zaglavlja
+        if redovi and not 3 <= broj <= 4:
+            errors.append(f"Istaknutih sastojaka mora biti 3 ili 4 (nađeno: {broj}). "
+                          "Nutritivna tablica i puni sastav idu odvojeno, ispod.")
+
+    # --- kliničke studije: svaki redak s vremenom, brojem ispitanika i metodom ---
+    if has_studies:
+        pos = next(i for i, h in enumerate(headings)
+                   if h["level"] == 2 and h["title"].startswith("4. Kliničke"))
+        blok = block_of(md, headings, pos)
+        for ln in blok.splitlines():
+            if not ln.strip().startswith("|") or "---" in ln or "Rezultat |" in ln:
+                continue
+            ima_broj = re.search(r"\d+\s*ispitanik", ln, re.IGNORECASE)
+            ima_vrijeme = re.search(r"\d+\s*(tjedan|tjedn|dan|dana|sat|sati|mjesec)",
+                                    ln, re.IGNORECASE)
+            ima_metodu = re.search(r"(procjen|mjerenj|metod|instrumental|ispitivanj)",
+                                   ln, re.IGNORECASE)
+            if not (ima_broj and ima_vrijeme and ima_metodu):
+                errors.append("Redak kliničkih studija nema sve obvezno (rezultat, "
+                              "vrijeme, broj ispitanika, metoda, izvor). Ako podaci "
+                              "nisu potpuni, IZOSTAVI cijeli blok Kliničke studije.")
+                break
+
+    # --- obvezni podaci u Tab 5 ---
+    if 5 in tab_blocks:
+        for polje, naziv in (("EAN", "EAN"), ("Proizvođač", "proizvođač"),
+                             ("Pakiranje", "pakiranje")):
+            red = re.search(rf"\|\s*{polje}[^|]*\|([^|]*)\|", tab_blocks[5],
+                            re.IGNORECASE)
+            if red and not red.group(1).strip():
+                errors.append(f"Obvezan podatak „{naziv}“ u Tabu 5 je prazan.")
 
     # --- EAN ---
     src_compact = norm_compact(product.naziv + " " +
@@ -1261,7 +1394,13 @@ def process_product(product: Product, category: str, sources: list[Source],
         raw = client.generate(system_prompt,
                               build_gen_user(product, category, sources, feedback,
                                              inventory))
+        raw, interni_json = odvoji_json_blok(raw)
         md = clean_markdown(raw)
+        md = R.ukloni_crtice(md)                    # Z4, sigurnosna mreža
+        md = R.primijeni_rjecnik(md)                # ujednačen zapis brendova
+        result.nedostaje = [str(x) for x in (interni_json.get("nedostaje") or [])]
+        if interni_json.get("konflikti"):
+            result.conflicts = [str(x) for x in interni_json["konflikti"]]
 
         errors = validate_pdp(md, product, category, sources)
         if errors:
@@ -1296,9 +1435,22 @@ def process_product(product: Product, category: str, sources: list[Source],
                 gaps = X.coverage_check(inventory, md) + \
                     X.placeholder_instead_of_value(inventory, md)
             if not gaps:
-                result.status = ("CONFLICT / REVIEW" if result.conflicts else "OK")
+                razlozi = []
+                obvezni = [n for n in result.nedostaje
+                           if re.search(r"ean|proizvo|pakiranj|sastav",
+                                        str(n), re.IGNORECASE)]
+                if obvezni:
+                    razlozi.append("nedostaje obvezan podatak: "
+                                   + ", ".join(obvezni))
+                if any(s.kind == SECONDARY_LABEL for s in sources):
+                    razlozi.append("korišten je izvor 2 (stranica brenda)")
                 if result.conflicts:
-                    result.notes.append("konflikt izvora označen za provjeru")
+                    razlozi.append("neslaganje izvora zabilježeno interno")
+                if razlozi:
+                    result.status = "TREBA PROVJERA"
+                    result.notes.extend(razlozi)
+                else:
+                    result.status = "OK"
                 return result, md
 
             result.coverage = gaps
@@ -1329,8 +1481,6 @@ def process_product(product: Product, category: str, sources: list[Source],
     if coverage_issues and not result.unsupported:
         result.status = "NEDOSTAJE PODATAK IZ IZVORA"
         result.verified = "prolazi (fact-check), coverage ne prolazi"
-    elif result.conflicts and not result.unsupported:
-        result.status = "CONFLICT / REVIEW"
     else:
         result.status = "TREBA PROVJERA"
         result.verified = "ne prolazi"

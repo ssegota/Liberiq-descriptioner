@@ -6,4 +6,4 @@ beautifulsoup4>=4.12   # parsiranje stranica
 pandas>=2.0            # ulazna tablica i indeks
 openpyxl>=3.1          # XLSX
 python-docx>=1.1       # PDP opisi u DOCX-u
-ddgs>=6.0              # web pretraga (prioritet 2 i 3)
+ddgs>=6.0              # pretraga službene stranice brenda (izvor 2)

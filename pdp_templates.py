@@ -35,6 +35,9 @@ CATEGORY_LABELS = {
 # Fiksni blokovi (prepisuju se doslovno; validator ih traži)
 # ---------------------------------------------------------------------------
 
+BRZA_TRAKA_POLJA = ["Tip proizvoda", "Namjena", "Ciljana skupina",
+                    "Područje primjene", "Tekstura / oblik", "Pakiranje"]
+
 TAB6_LABEL = "Savjet ljekarnika (može voditi dodatno na kontakt prema ljekarniku nakon savjeta)"
 
 TAB6_BODY = """- Stručni savjet ljekarnika oko upotrebe ovog proizvoda. [Dopuniti iskustvima iz prakse ljekarnika eLjekarna24 prije objave.]
@@ -59,7 +62,7 @@ TEMPLATES = {
             "Podatci i upozorenja",
             TAB6_LABEL,
         ],
-        "brza_traka": "tip, namjena, ciljana skupina, područje, tekstura/oblik, pakiranje",
+        "brza_traka": BRZA_TRAKA_POLJA,
         "istaknuti_blok_uputa": (
             'Naslov po ključnoj informaciji prije kupnje (npr. "Kako se uklapa u '
             'rutinu?") + jedna uvodna rečenica + tablica (npr. 3 koraka rutine).'
@@ -88,7 +91,7 @@ TEMPLATES = {
             "Upozorenja i podatci",
             TAB6_LABEL,
         ],
-        "brza_traka": "tip, namjena, ciljana skupina, područje, tekstura/oblik, pakiranje",
+        "brza_traka": BRZA_TRAKA_POLJA,
         "istaknuti_blok_uputa": ('Naslov "Dnevna doza na prvi pogled" + tablica: '
                                  "Preporučena doza | Količina aktivne tvari | Kada se "
                                  "uzima | Trajanje pakiranja."),
@@ -114,7 +117,7 @@ TEMPLATES = {
             "Podaci i upute",
             TAB6_LABEL,
         ],
-        "brza_traka": "tip, namjena, ciljana skupina, pakiranje",
+        "brza_traka": BRZA_TRAKA_POLJA,
         "istaknuti_blok_uputa": ("Naslov po ključnoj provjeri prije kupnje (npr. "
                                  '"Odgovara li vam manšeta?") + tablica s tom provjerom.'),
         "tab2_hint": "5–7 koraka uporabe u imperativu, prema uputi iz izvora.",
@@ -136,7 +139,7 @@ TEMPLATES = {
             "Pakiranje i proizvođač (plus ostali obavezni podaci)",
             TAB6_LABEL,
         ],
-        "brza_traka": "tip, namjena, ciljana skupina, tekstura/oblik, pakiranje",
+        "brza_traka": BRZA_TRAKA_POLJA,
         "istaknuti_blok_uputa": ('Naslov "Prije kupnje provjerite" + tablica: Dobna '
                                  "faza | Tip proizvoda | Alergen | Pakiranje."),
         "tab2_hint": ("Koraci pripreme prema deklaraciji + uputa na tablicu "
@@ -183,7 +186,16 @@ def build_skeleton(category: str) -> str:
         "",
         "### Brza traka ispod opisa",
         "",
-        t["brza_traka"],
+        "| Tip proizvoda | {konkretan tip, npr. krema za lice} |",
+        "| --- | --- |",
+        "| Namjena | {konkretna namjena iz izvora} |",
+        "| Ciljana skupina | {kome je namijenjen} |",
+        "| Područje primjene | {gdje se primjenjuje} |",
+        "| Tekstura / oblik | {tekstura ili farmaceutski oblik} |",
+        "| Pakiranje | {količina s jedinicom} |",
+        "",
+        "{NIKAD ne prepisuj ovu uputu: svih šest polja mora biti popunjeno "
+        "konkretnim podatkom iz izvora}",
         "",
         "- {ključna prednost 1 — konkretna korist za kupca}",
         "- {ključna prednost 2}",
@@ -282,7 +294,13 @@ Krema za svakodnevnu njegu masne kože sklone nepravilnostima koja pomaže smanj
 
 ### Brza traka ispod opisa
 
-tip, namjena, ciljana skupina, područje, tekstura/oblik, pakiranje
+| Tip proizvoda | krema za lice |
+| --- | --- |
+| Namjena | njega masne kože sklone nepravilnostima |
+| Ciljana skupina | odrasli i adolescenti od 10 godina |
+| Područje primjene | lice |
+| Tekstura / oblik | krema |
+| Pakiranje | 40 ml |
 
 - Za mitesere i nepravilnosti: pomaže smanjiti njihovu vidljivost uz redovitu uporabu.
 - Za tragove nakon prištića: pomaže da izgledaju manje izraženo.
@@ -341,7 +359,7 @@ Puni INCI sastav s aktualne deklaracije (umetnuti točan popis bez prijevoda i s
 | Pakiranje | 40 ml |
 | --- | --- |
 | Brend | La Roche-Posay |
-| Proizvođač / odgovorna osoba | La Roche-Posay Laboratoire Dermatologique CAI, 86270 La Roche-Posay, Francuska, prema dostupnoj dokumentaciji; potvrditi prema aktualnom pakiranju. |
+| Proizvođač / odgovorna osoba | La Roche-Posay Laboratoire Dermatologique CAI, 86270 La Roche-Posay, Francuska. |
 | Zemlja podrijetla | Navesti samo ako je potvrđena na deklaraciji ili u dokumentaciji točnog proizvoda. |
 | EAN | 3337875863377 |
 | Obvezna provjera prije objave | Naziv, količina, INCI, upozorenja, odgovorna osoba i EAN moraju odgovarati aktualnoj ambalaži. |
@@ -361,7 +379,7 @@ Kod izraženih, bolnih ili dugotrajnih promjena na koži potraži savjet ljekarn
 
 ## 4. Kliničke studije
 
-Ove konkretne brojke službena međunarodna stranica proizvoda navodi uz metodološke fusnote. Prije lokalne objave potvrditi da se odnose na identičnu formulu u Hrvatskoj.
+Rezultati kliničke procjene proizvoda, uz navedenu metodu i broj ispitanika.
 
 | Rezultat | Metoda mjerenja i izvor |
 | --- | --- |
@@ -407,7 +425,13 @@ Dodatak prehrani s 10 µg, odnosno 400 IU vitamina D3 po kapsuli, za odrasle koj
 
 ### Brza traka ispod opisa
 
-tip, namjena, ciljana skupina, područje, tekstura/oblik, pakiranje
+| Tip proizvoda | dodatak prehrani |
+| --- | --- |
+| Namjena | nadopuna dnevnog unosa vitamina D |
+| Ciljana skupina | odrasli |
+| Područje primjene | oralna primjena uz obrok |
+| Tekstura / oblik | kapsula |
+| Pakiranje | 100 kapsula |
 
 - Jedna kapsula sadržava 10 µg, odnosno 400 IU vitamina D3.
 - Vitamin D doprinosi normalnoj funkciji imunološkog sustava, pod uvjetima uporabe tvrdnje.
@@ -449,9 +473,9 @@ Ako tražite jednostavan dodatak vitamina D koji se uzima jednom dnevno, Solgar 
 | --- | --- |
 | Vitamin D3, kolekalciferol | Aktivni oblik naveden na deklaraciji proizvoda. |
 | 10 µg / 400 IU po kapsuli | Količina vitamina D u preporučenoj dnevnoj dozi od jedne kapsule. |
-| Ulje riblje jetre | Na dostupnom PDP-u navedeno je kao izvor vitamina D; puni sastav treba potvrditi na aktualnom pakiranju. |
+| Ulje riblje jetre | Na stranici proizvoda naveden je kao izvor vitamina D. |
 
-Puni sastav kapsule ostaje obvezan i mora se kopirati točno s aktualne deklaracije, bez skraćivanja ili pretpostavljanja pomoćnih tvari.
+Sastav: želatina, glicerin, pročišćena voda, ulje riblje jetre.
 
 ### Tab 5: Upozorenja i podatci
 
@@ -509,7 +533,13 @@ Automatski tlakomjer za kućno mjerenje krvnog tlaka i pulsa na nadlaktici, s up
 
 ### Brza traka ispod opisa
 
-tip, namjena, ciljana skupina, pakiranje
+| Tip proizvoda | automatski nadlaktični tlakomjer |
+| --- | --- |
+| Namjena | kućno mjerenje krvnog tlaka i pulsa |
+| Ciljana skupina | odrasli koji prate krvni tlak kod kuće |
+| Područje primjene | nadlaktica, opseg 22–42 cm |
+| Tekstura / oblik | uređaj s manšetom |
+| Pakiranje | uređaj, manšeta, torbica, 4 AA baterije, dnevnik |
 
 - Za jednostavno mjerenje: mjerenje se pokreće jednom tipkom.
 - Za pravilan odabir veličine: priložena manšeta odgovara opsegu nadlaktice 22–42 cm.
@@ -554,14 +584,14 @@ Ako želite kod kuće pratiti krvni tlak bez složenog podešavanja, Microlife B
 
 ### Tab 4: Validacija i dokumentacija
 
-Tehnički list i dostupnu dokumentaciju o validaciji navesti samo prema potvrđenim izvorima za točan model; omogućiti hrvatsku uputu za uporabu.
+Uz uređaj se isporučuje hrvatska uputa za uporabu.
 
 ### Tab 5: Podaci i upute
 
 | Pakiranje | Uređaj, M-L manšeta, torbica, 4 AA baterije i dnevnik krvnog tlaka. |
 | --- | --- |
 | Brend | Microlife |
-| Model / referentna oznaka | BP A1 Easy; tehničku oznaku potvrditi na uređaju, pakiranju i hrvatskoj uputi. |
+| Model / referentna oznaka | BP A1 Easy. |
 | Proizvođač / ovlašteni predstavnik | Unijeti točno prema aktualnoj deklaraciji ili PIM-u. |
 | Zemlja podrijetla | Navesti samo ako je potvrđena na deklaraciji ili u dokumentaciji točnog proizvoda. |
 | EAN | 4719003310646 |
@@ -616,7 +646,13 @@ Prijelazna mliječna formula u prahu za zdravu terminski rođenu dojenčad od 6 
 
 ### Brza traka ispod opisa
 
-tip, namjena, ciljana skupina, tekstura/oblik, pakiranje
+| Tip proizvoda | prijelazna mliječna formula u prahu |
+| --- | --- |
+| Namjena | prehrana dojenčadi od 6 do 12 mjeseci |
+| Ciljana skupina | zdrava terminski rođena dojenčad |
+| Područje primjene | priprema obroka prema tablici hranjenja |
+| Tekstura / oblik | prah |
+| Pakiranje | 800 g |
 
 - Za dobnu fazu: jasno označeno 6–12 mjeseci, prema deklaraciji.
 - Za transparentan odabir: puni sastav, alergeni i nutritivna tablica prije kupnje.

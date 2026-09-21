@@ -36,6 +36,7 @@ import threading
 from pathlib import Path
 
 import pdp_generator as P
+import pravila as R
 import prompts_cfg
 import pdp_templates as T
 import seo_meta_generator as S
@@ -85,29 +86,16 @@ def canonical_name_from_md(md: str) -> str:
 
 
 def brand_source_for(sources, brend: str):
-    """Sekundarni izvor za SEO, po klijentovoj hijerarhiji:
-    1) stranica proizvoda (uvijek primarna, nije ovdje),
-    2) zadani sekundarni izvor webljekarna.vasezdravlje.com,
-    3) službena stranica brenda.
-    Ostali (forumi, konkurenti, tražilice) se za SEO ne koriste."""
-    import re as _re
-    from urllib.parse import urlparse as _urlparse
-
-    # prioritet 2 — zadani sekundarni izvor
+    """Izvor 2 za SEO: isključivo službena hrvatska stranica brenda.
+    Sve ostalo (druge ljekarne, tražilice, strana tržišta) blokira allowlist."""
     for s in sources:
-        if P.SECONDARY_DOMAIN in _urlparse(s.url).netloc.lower():
-            return S.BrandSource(url=s.url, text=s.text[:2000])
-
-    # prioritet 3 — službena stranica brenda
-    tokens = [t for t in _re.sub(r"[^a-z0-9 ]", " ",
-                                 (brend or "").lower()).split() if len(t) >= 4]
-    for s in sources:
-        if s.kind != "web":
+        if s.kind != P.SECONDARY_LABEL:
             continue
-        host_norm = _re.sub(r"[^a-z0-9]", "", _urlparse(s.url).netloc.lower())
-        if any(t in host_norm for t in tokens):
+        dopusteno, _razlog = R.je_dopusten(s.url, brend)
+        if dopusteno:
             return S.BrandSource(url=s.url, text=s.text[:2000])
     return None
+
 
 SEO_COLS = ["Title tag", "Title px", "Title znakova", "Meta opis", "Meta px",
             "Meta znakova", "Namjena", "Status", "Pokušaji", "Napomene",
@@ -145,13 +133,92 @@ def combined_record(product: P.Product, seo_res, pdp_res, model_id: str,
         rec["Ukupni status"] = "OK"
     else:
         # najozbiljniji status pobjeđuje (klijentove oznake)
-        prio = ["GREŠKA EKSTRAKCIJE", "GREŠKA", "NEDOSTAJE PODATAK IZ IZVORA",
-                "CONFLICT / REVIEW", "TREBA PROVJERA"]
+        prio = ["GREŠKA", "GREŠKA EKSTRAKCIJE", "NEDOSTAJE PODATAK IZ IZVORA",
+                "TREBA PROVJERA"]
         rec["Ukupni status"] = next(
             (s for s in prio if any(str(x).startswith(s) for x in statuses)),
             "TREBA PROVJERA")
     rec["Model"] = model_id
     return rec
+
+
+KLIJENT_COLS = ["Sekcija", "Brend", "SKU", "Naziv", "URL", "Title tag",
+                "Title (px)", "Meta opis", "Meta opis (px)"]
+
+INTERNI_COLS = ["Sekcija", "Brend", "SKU", "Naziv", "URL", "Status",
+                "Izvor – eljekarna24", "Izvor – brend", "Preuzeto s brend stranice",
+                "Nedostaje", "Konflikti", "Napomena validatora",
+                "PDP Status", "PDP datoteka", "Trajanje", "Model"]
+
+
+def write_klijent_file(records: list[dict], out_dir: Path):
+    """Datoteka za klijenta: samo title i meta, bez ijednog internog stupca."""
+    import pandas as pd
+
+    redci = []
+    for r in records:
+        if str(r.get("SEO Status", "")) == "GREŠKA":
+            continue
+        redci.append({
+            "Sekcija": r.get("Sekcija", ""), "Brend": r.get("Brend", ""),
+            "SKU": r.get("SKU", ""), "Naziv": r.get("Naziv", ""),
+            "URL": r.get("URL", ""),
+            "Title tag": r.get("SEO Title tag", ""),
+            "Title (px)": r.get("SEO Title px", ""),
+            "Meta opis": r.get("SEO Meta opis", ""),
+            "Meta opis (px)": r.get("SEO Meta px", ""),
+        })
+    df = pd.DataFrame(redci, columns=KLIJENT_COLS)
+    xlsx = out_dir / "title_meta_za_klijenta.xlsx"
+    df.to_csv(out_dir / "title_meta_za_klijenta.csv", index=False,
+              encoding="utf-8-sig")
+    with pd.ExcelWriter(xlsx, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Title i meta")
+        ws = w.sheets["Title i meta"]
+        for col, width in zip("ABCDEFGHI", (16, 16, 12, 46, 46, 60, 10, 80, 12)):
+            ws.column_dimensions[col].width = width
+    return xlsx
+
+
+def write_interni_file(records: list[dict], out_dir: Path):
+    """Interna datoteka: statusi, izvori, nedostaci, konflikti, napomene."""
+    import pandas as pd
+
+    redci = []
+    for r in records:
+        napomene = " | ".join(x for x in (r.get("SEO Napomene", ""),
+                                          r.get("PDP Napomene", ""),
+                                          r.get("PDP Coverage check", "")) if x
+                              and x != "prolazi")
+        redci.append({
+            "Sekcija": r.get("Sekcija", ""), "Brend": r.get("Brend", ""),
+            "SKU": r.get("SKU", ""), "Naziv": r.get("Naziv", ""),
+            "URL": r.get("URL", ""),
+            "Status": r.get("Ukupni status", ""),
+            "Izvor – eljekarna24": r.get("SEO Izvor – eljekarna24", ""),
+            "Izvor – brend": r.get("SEO Izvor – brend", ""),
+            "Preuzeto s brend stranice": r.get("SEO Preuzeto s brend stranice", ""),
+            "Nedostaje": r.get("PDP Nedostaje", ""),
+            "Konflikti": r.get("PDP Konflikt izvora", ""),
+            "Napomena validatora": napomene,
+            "PDP Status": r.get("PDP Status", ""),
+            "PDP datoteka": r.get("PDP DOCX datoteka", ""),
+            "Trajanje": r.get("Trajanje", ""),
+            "Model": r.get("Model", ""),
+        })
+    df = pd.DataFrame(redci, columns=INTERNI_COLS)
+    xlsx = out_dir / "interno.xlsx"
+    df.to_csv(out_dir / "interno.csv", index=False, encoding="utf-8-sig")
+    with pd.ExcelWriter(xlsx, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Interno")
+        ws = w.sheets["Interno"]
+        for idx, col in enumerate(df.columns, start=1):
+            ws.cell(row=1, column=idx).column_letter
+        for col, width in zip("ABCDEFGHIJKLMNOP",
+                              (16, 14, 12, 40, 44, 20, 44, 44, 34, 30, 34, 60,
+                               22, 44, 12, 26)):
+            ws.column_dimensions[col].width = width
+    return xlsx
 
 
 def write_index(records: list[dict], out_dir: Path):
@@ -208,8 +275,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--search-results", type=int, default=3)
     ap.add_argument("--no-web-search", action="store_true")
     ap.add_argument("--no-secondary", action="store_true",
-                    help=f"ne koristi zadani sekundarni izvor "
-                         f"({P.SECONDARY_DOMAIN})")
+                    help="ne koristi izvor 2 (službenu stranicu brenda)")
     ap.add_argument("--no-fetch", action="store_true")
     ap.add_argument("--no-verify", action="store_true")
     ap.add_argument("--no-extract", action="store_true",
@@ -317,6 +383,22 @@ def main() -> None:
             seo_res = pdp_res = None
             canonical = ""
 
+            # Upute: ako stranica eljekarna24 nije dohvaćena, status je GREŠKA
+            # i ne generira se ni SEO ni PDP.
+            if not page.fetched or not sources:
+                rec = combined_record(p, None, None, client.model_id, page.fetched)
+                rec["Ukupni status"] = "GREŠKA"
+                rec["SEO Status"] = "GREŠKA"
+                rec["PDP Status"] = "GREŠKA"
+                rec["SEO Napomene"] = ("Stranica proizvoda na eljekarna24 nije "
+                                       "dohvaćena; sadržaj se ne generira.")
+                records[p.sku] = rec
+                with jsonl_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                print(f"[{idx}/{len(todo)}] {p.sku} {p.naziv[:40]:<40} -> GREŠKA "
+                      "(stranica nije dohvaćena)")
+                continue
+
             # PDP ide PRVI: iz njega dolazi kanonski naziv za title
             if args.only in ("pdp", "both"):
                 pdp_res, md = P.process_product(
@@ -365,12 +447,16 @@ def main() -> None:
 
     ordered = [records[p.sku] for p in products if p.sku in records]
     xlsx_path, csv_path = write_index(ordered, out_dir)
+    klijent_path = write_klijent_file(ordered, out_dir)
+    interni_path = write_interni_file(ordered, out_dir)
 
     ok = sum(1 for r in ordered if str(r.get("Ukupni status", "")).startswith("OK"))
     print(f"\nGotovo: {ok} OK, {len(ordered) - ok} za provjeru.")
     if args.only in ("pdp", "both"):
         print(f"PDP datoteke: {pdp_dir}/  (MD + DOCX po proizvodu)")
-    print(f"Indeks: {xlsx_path}\n        {csv_path}")
+    print(f"Za klijenta: {klijent_path}")
+    print(f"Interno:     {interni_path}")
+    print(f"Puni indeks: {xlsx_path}")
     if len(ordered) - ok:
         print("Retke koji nisu OK regeneriraj s: --retry-review (ili --sku <SKU>).")
 

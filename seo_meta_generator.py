@@ -56,6 +56,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import pravila as R
 import prompts_cfg
 
 # ---------------------------------------------------------------------------
@@ -265,6 +266,11 @@ UNIT_ABBREV_RE = re.compile(
 NO_SPACE_UNIT_RE = re.compile(
     r"\b\d+(?:[.,]\d+)?(ml|mg|mcg|kg|g|l|IU)\b")
 # oznake namjene u meta opisu (klijent: namjena je OBVEZNA)
+# Količina PAKIRANJA (mg, mcg, µg i IU su jačina, ne količina pakiranja).
+KOLICINA_U_META_RE = re.compile(
+    r"\b\d+(?:[.,]\d+)?\s*(?:ml|l|kg|g|tablet\w*|kapsul\w*|vrećic\w*|"
+    r"vrecic\w*|komad\w*|bombon\w*|šumeć\w*)\b", re.IGNORECASE)
+
 PURPOSE_RE = re.compile(
     r"\b(za |kod |protiv |namijenjen\w*|namjena|pomaže|pomaze|doprinosi|"
     r"koristi se|primjenjuje se|u njezi|za njegu|za zaštitu|za zastitu|"
@@ -661,7 +667,17 @@ PRAVILA ZA TITLE TAG
 5. ZABRANJENO: nizovi ključnih riječi, akcije, cijene, dostava, RIJEČI PISANE
    VELIKIM SLOVIMA (osim standardnih kratica poput SPF), neprovjereni superlativi
    (uključujući "idealan", "idealno", "savršen", "najbolji").
-5e. NIKAD DEFINITIVNI IZRAZI koji nisu specifično dokazani u izvorima:
+5f. TITLE SE GRADI IZ PDP NAZIVA: koristi SAMO riječi iz kanonskog naziva,
+   istim redoslijedom. Ne preformuliraj i ne dodaj riječi kojih ondje nema.
+5g. Uvijek zadrži brend, naziv linije, tip proizvoda, varijantu (nijansa, SPF,
+   Riche, Légère, jakost) i količinu s jedinicom.
+5h. Ako treba skratiti, ukloni CIJELI segment ovim redom: namjena iza crtice
+   ili zareza, zatim opći pridjevi, zatim sporedne značajke. Nikad ne reži
+   frazu na pola.
+5i. Title ne završava prijedlogom, veznikom ni znakom (za, i, s, od, protiv, &)
+   ni brojem bez jedinice.
+5j. BEZ CRTICA (– i —) u titlu i meta opisu. Umjesto njih zarez ili točka.
+5k. NIKAD DEFINITIVNI IZRAZI koji nisu specifično dokazani u izvorima:
    "najbolji", "najučinkovitiji", "najsigurniji", "jedini", "zlatni standard",
    "prvi izbor", "apsolutno", "uvijek djeluje", "svima odgovara", "bez
    iznimke", "trenutni rezultati", "bez ikakvih nuspojava". Umjesto tvrdnje o
@@ -686,7 +702,18 @@ PRAVILA ZA META OPIS
    nadopuniti unos vitamina D", "za kućno mjerenje krvnog tlaka"). Ako se
    namjena NE MOŽE potvrditi iz izvora, NE izmišljaj je — u polje
    "namjena_potvrdjena" upiši false i napiši meta opis bez izmišljene namjene.
-1b. Naziv, namjena i količina idu u PRVU rečenicu kad god je moguće.
+1b. PRVA REČENICA: naziv bez količine, zatim namjena, zatim količina.
+   Primjer: „Solgar Vitamin K1 100 mcg za odrasle, 100 tableta.“
+   DRUGA REČENICA: jedna ili dvije specifikacije iz izvora.
+1c. Namjena mora biti unutar prvih 100 znakova.
+1d. Količina se piše SAMO JEDNOM, u prvoj rečenici. Bez „Pakiranje od“,
+   „Volumen“, „Dostupno u“.
+1e. Meta opis sadrži brend i naziv linije iz titla.
+1f. TVRDNJE PO KATEGORIJI: dodaci prehrani samo odobrene zdravstvene tvrdnje
+   doslovno iz izvora; hrana za dojenčad samo namjena i dob, bez zdravstvenih
+   tvrdnji; medicinski proizvodi samo tvrdnje iz upute; kozmetika tvrdnja o
+   učinku samo doslovno iz izvora. Ne pojačavaj tvrdnju iz izvora
+   („podnošljivost ispitana na atopičnoj koži“ nije „pogodno za atopičnu kožu“).
 2. Duljina: {META_TARGET_CHARS} znakova; tvrdi limit {META_MAX_PX:.0f} px. Kratko,
    čitljivo, bez nepotrebnih uvoda.
 3. Tekst mora biti smislen i završen: potpuna zadnja rečenica koja završava
@@ -863,6 +890,23 @@ def validate_candidate(cand: Candidate, product: Product, page: PageData,
             errors.append(
                 f"Title je izgubio količinu ({sorted(src_qty)[0]}). Količina se "
                 "NIKAD ne uklanja — skrati uklanjanjem sporednih značajki.")
+        if R.zavrsava_lose(title):
+            errors.append("Title završava prijedlogom, veznikom, znakom ili brojem "
+                          "bez jedinice. Ukloni cijeli segment, ne dio fraze.")
+        if R.nadi_crtice(title):
+            errors.append("Title sadrži crticu (– ili —). Ukloni je; crtica ostaje "
+                          "samo u rasponu brojeva.")
+        for hit in R.nadi_zabranjene_rijeci(title):
+            errors.append(f"Zabranjena riječ u titlu: {hit}.")
+        if canonical_name:
+            rijeci_naziva = {w for w in norm_spaced(canonical_name).split()}
+            visak = [w for w in norm_spaced(title).split()
+                     if w not in rijeci_naziva and w not in {"eljekarna24"}
+                     and len(w) > 2]
+            if visak:
+                errors.append(f"Title sadrži riječi kojih nema u PDP nazivu: "
+                              f"{', '.join(visak[:4])}. Koristi samo riječi iz PDP "
+                              "naziva, istim redoslijedom.")
         for hit in find_forbidden(title):
             errors.append(f"Zabranjeni izraz u titlu: {hit}.")
 
@@ -896,6 +940,33 @@ def validate_candidate(cand: Candidate, product: Product, page: PageData,
                 "Meta opis mora završiti potpunom rečenicom i točkom "
                 "(bez trotočja i bez CTA-a)."
             )
+        if not PURPOSE_RE.search(meta[:100]):
+            errors.append("Namjena mora biti unutar prvih 100 znakova meta opisa.")
+        for fraza in ("pakiranje od", "volumen", "dostupno u", "dostupna u",
+                      "paket od"):
+            if fraza in meta.lower():
+                errors.append(f"Meta opis sadrži zabranjenu formulaciju količine "
+                              f"„{fraza}“. Količina se piše samo jednom, u prvoj "
+                              "rečenici.")
+        if len(KOLICINA_U_META_RE.findall(meta)) > 1:
+            errors.append("Količina se u meta opisu spominje više puta. Napiši je "
+                          "samo jednom, u prvoj rečenici.")
+        if R.nadi_crtice(meta):
+            errors.append("Meta opis sadrži crticu (– ili —). Umjesto nje zarez "
+                          "ili točka.")
+        for hit in R.nadi_zabranjene_rijeci(meta):
+            errors.append(f"Zabranjena riječ u meta opisu: {hit}.")
+        if canonical_name:
+            brend_rijec = (canonical_name.split() or [""])[0]
+            if brend_rijec and norm_compact(brend_rijec) not in norm_compact(meta):
+                errors.append(f"Meta opis ne sadrži brend „{brend_rijec}“ iz titla.")
+        if title:
+            kol_title = R.kolicina_iz(title)
+            kol_meta = R.kolicina_iz(meta)
+            if kol_title and kol_meta and norm_compact(kol_title) != norm_compact(kol_meta):
+                errors.append(f"Količina se razlikuje: title „{kol_title}“, meta "
+                              f"„{kol_meta}“. Mora biti ista u PDP nazivu, titlu i "
+                              "meta opisu.")
         for hit in find_forbidden(meta):
             errors.append(f"Zabranjeni izraz u meta opisu: {hit}.")
         for word in CAPS_WORD_RE.findall(meta):
@@ -937,6 +1008,29 @@ def validate_candidate(cand: Candidate, product: Product, page: PageData,
 # ---------------------------------------------------------------------------
 # Determinističko skraćivanje (fallback nakon max pokušaja)
 # ---------------------------------------------------------------------------
+
+VARIJANTE = ("riche", "légère", "legere", "light", "medium", "extra", "forte",
+             "plus", "intense", "spf", "pigment correct", "uvmune", "optipro",
+             "comfortis", "supremepro", "bisglycinate", "citrate")
+
+
+def obavezni_pojmovi(naziv: str) -> list[str]:
+    """Pojmovi koji se pri skraćivanju nikad ne uklanjaju: brend, linija,
+    varijanta (nijansa, SPF, Riche, jakost) i količina s jedinicom."""
+    pojmovi = []
+    nisko = (naziv or "").lower()
+    for oznaka in VARIJANTE:
+        if oznaka in nisko:
+            i = nisko.index(oznaka)
+            pojmovi.append(naziv[i:i + len(oznaka)])
+    kolicina = R.kolicina_iz(naziv)
+    if kolicina:
+        pojmovi.append(kolicina)
+    prve = (naziv or "").split()[:3]           # brend + početak linije
+    if prve:
+        pojmovi.append(" ".join(prve[:2]))
+    return pojmovi
+
 
 def trim_title_to_px(title: str, limit_px: float, keep_qty: set[str] | None = None) -> str:
     """Skraćuje s kraja, ali NIKAD ne uklanja količinu (klijentovo pravilo).
@@ -1072,9 +1166,11 @@ def process_product(product: Product, page: PageData, client: BedrockClient,
     length_only = remaining and all(("px" in e and "predug" in e) or "mora biti ≤" in e
                                     for e in remaining)
     if remaining and length_only:
-        title_core = trim_title_to_px(
-            title_core, TITLE_CORE_TARGET_PX,
-            keep_qty=quantity_tokens(canonical_name or product.naziv))
+        izvor_naziv = canonical_name or product.naziv
+        title_core = R.skrati_po_segmentima(
+            title_core or izvor_naziv,
+            stane=lambda t: text_width_px(t, TITLE_FONT_PX) <= TITLE_CORE_TARGET_PX,
+            obavezno=obavezni_pojmovi(izvor_naziv))
         meta = trim_meta_to_px(meta, META_MAX_PX)
         with lock:
             recheck = validate_candidate(
@@ -1098,9 +1194,8 @@ def process_product(product: Product, page: PageData, client: BedrockClient,
         result.notes.append("podatak s brend stranice — obvezna ljudska provjera: "
                             + ", ".join(result.brand_data))
     if not remaining:
-        result.status = ("TREBA PROVJERA" if result.brand_data else
-                         ("OK" if "automatski skraćeno na limit" not in result.notes
-                          else "OK (skraćeno)"))
+        # status OK samo kad validator nema nijednu napomenu (upute, točka 6)
+        result.status = "TREBA PROVJERA" if result.brand_data else "OK"
         with lock:
             seen_titles.add(norm_compact(title_core))
             seen_metas.add(norm_compact(meta))

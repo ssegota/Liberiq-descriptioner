@@ -17,6 +17,7 @@ setup:          ## venv, ovisnosti i .env iz predloška
 	@echo "Gotovo. Aktiviraj: source .venv/bin/activate — pa uredi .env"
 
 test:           ## offline testovi (bez Bedrocka i mreže)
+	$(PY) test_upute.py
 	$(PY) test_klijent.py
 	$(PY) test_all.py
 	$(PY) test_prompts.py

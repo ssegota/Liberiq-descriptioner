@@ -8,6 +8,7 @@ import threading
 import generate_all as A
 import pdp_extract as X
 import pdp_generator as P
+import pravila as R
 import pdp_templates as T
 import seo_meta_generator as S
 
@@ -206,16 +207,19 @@ class PDPClient:
     def generate(self, s, u):
         assert "INVENTAR" in u and "HARD FIELD" in s
         self.n += 1
-        return md_lost if self.n == 1 else md_ok
+        doc = md_lost if self.n == 1 else md_ok
+        return doc + '\n\n```json\n{"nedostaje": [], "konflikti": [], ' \
+                     '"koristeni_izvori": ["S1"]}\n```'
+
     def verify(self, s, u):
         return json.dumps({"prolazi": True, "nepotkrijepljene_tvrdnje": [],
                            "napomena": ""}, ensure_ascii=False)
 
 cl = PDPClient()
 res, md = P.process_product(PPROD, "cosmetics", SRC, cl, 3, True)
-check("pipeline: coverage vratio pisca na dopunu", cl.n == 2, f"(poziva: {cl.n})")
-check("pipeline: status CONFLICT / REVIEW (konflikt u inventaru)",
-      res.status == "CONFLICT / REVIEW", f"({res.status})")
+check("pipeline: coverage vratio pisca na dopunu", cl.n >= 2, f"(poziva: {cl.n})")
+check("pipeline: konflikt ne ide u tekst nego u interni status",
+      res.status != "OK" and res.conflicts, f"({res.status})")
 check("pipeline: inventar zapisan u rezultat",
       res.inventory is not None and len(res.inventory.found()) == 3)
 
@@ -224,8 +228,7 @@ class LosingClient(PDPClient):
     def generate(self, s, u): return md_lost
 res2, _ = P.process_product(PPROD, "cosmetics", SRC, LosingClient(), 2, True)
 check("status NEDOSTAJE PODATAK IZ IZVORA",
-      res2.status in ("NEDOSTAJE PODATAK IZ IZVORA", "CONFLICT / REVIEW"),
-      f"({res2.status})")
+      res2.status == "NEDOSTAJE PODATAK IZ IZVORA", f"({res2.status})")
 check("coverage zapisan u rezultat", len(res2.coverage) > 0)
 
 # 18. GREŠKA EKSTRAKCIJE
@@ -249,18 +252,21 @@ check("kanonski naziv izvučen iz PDP-a",
 
 # 21. brand source samo sa službene domene brenda
 srcs = [P.Source("S1", "stranica proizvoda", "https://eljekarna24.hr/x", "t", "a"),
-        P.Source("S2", "web", "https://www.laroche-posay.hr/effaclar", "t", "b" * 300),
+        P.Source("S2", P.SECONDARY_LABEL,
+                 "https://www.laroche-posay.com.hr/effaclar", "t", "b" * 300),
         P.Source("S3", "web", "https://neki-forum.hr/tema", "t", "c" * 300)]
 bs = A.brand_source_for(srcs, "La Roche-Posay")
-check("brend izvor prepoznat sa službene domene",
-      bs is not None and "laroche-posay" in bs.url)
+check("brend izvor prepoznat sa službene hrvatske domene",
+      bs is not None and "laroche-posay.com.hr" in bs.url)
 check("treći izvor se ne koristi za SEO",
       A.brand_source_for([srcs[0], srcs[2]], "La Roche-Posay") is None)
+check("strana domena brenda se ne koristi",
+      R.je_dopusten("https://laroche-posay.rs/p", "La Roche-Posay")[0] is False)
 
 # 22. prioritet statusa u zbirnom retku
 r = A.combined_record(PPROD, None, res2, "m", True)
 check("zbirni status preuzima najozbiljniju oznaku",
-      r["Ukupni status"] in ("NEDOSTAJE PODATAK IZ IZVORA", "CONFLICT / REVIEW"),
+      r["Ukupni status"] == "NEDOSTAJE PODATAK IZ IZVORA",
       f"({r['Ukupni status']})")
 
 print()
@@ -273,26 +279,20 @@ print("\n=== Hijerarhija izvora i definitivni izrazi ===")
 
 # 23. hijerarhija: S1 link, S2 vasezdravlje, S3+ ostali
 srcs = [P.Source("S1", "stranica proizvoda", "https://eljekarna24.hr/x", "t", "a"),
-        P.Source("S2", P.SECONDARY_LABEL,
-                 "https://webljekarna.vasezdravlje.com/proizvod", "t", "b"),
-        P.Source("S3", "web", "https://www.solgar.com/x", "t", "c")]
+        P.Source("S2", P.SECONDARY_LABEL, "https://solgar.hr/proizvod", "t", "b"),
+        P.Source("S3", "web", "https://webljekarna.vasezdravlje.com/p", "t", "c")]
 blok = P.sources_block(srcs)
-check("prompt označava PRIORITET 1/2/3",
-      "PRIORITET 1" in blok and "PRIORITET 2" in blok and "PRIORITET 3" in blok)
-check("sekundarni izvor je vasezdravlje",
-      P.SECONDARY_DOMAIN == "webljekarna.vasezdravlje.com" and
-      P.SECONDARY_DOMAIN in blok)
+check("prompt označava PRIORITET 1 i 2 (bez trećih izvora)",
+      "PRIORITET 1" in blok and "PRIORITET 2" in blok and "PRIORITET 3" not in blok)
+check("vasezdravlje je zabranjen izvor",
+      R.je_dopusten("https://webljekarna.vasezdravlje.com/p", "Solgar")[0] is False)
 
 # 24. SEO sekundarni izvor: vasezdravlje ima prednost pred brendom
 bs = A.brand_source_for(srcs, "Solgar")
-check("SEO: prioritet 2 ispred brenda",
-      bs is not None and P.SECONDARY_DOMAIN in bs.url, f"({bs.url if bs else None})")
-bs2 = A.brand_source_for([srcs[0], srcs[2]], "Solgar")
-check("SEO: brend kao prioritet 3 kad nema vasezdravlja",
-      bs2 is not None and "solgar" in bs2.url)
-bs3 = A.brand_source_for([srcs[0], P.Source("S2", "web", "https://forum.hr/t", "t", "x")],
-                         "Solgar")
-check("SEO: ostali izvori se ne koriste", bs3 is None)
+check("SEO izvor 2 je službena stranica brenda",
+      bs is not None and "solgar.hr" in bs.url, f"({bs.url if bs else None})")
+bs3 = A.brand_source_for([srcs[0], srcs[2]], "Solgar")
+check("SEO: druga ljekarna se ne koristi", bs3 is None)
 
 # 25. definitivni izrazi
 for izraz in ("Najbolji izbor za kožu.", "Najučinkovitiji proizvod u ponudi.",
@@ -314,7 +314,7 @@ check("pravilo u PDP promptu",
       "ZABRANA DEFINITIVNIH IZRAZA" in P.build_gen_system("cosmetics"))
 check("hijerarhija u PDP promptu",
       "PRIORITET 2" in P.build_gen_system("cosmetics") and
-      P.SECONDARY_DOMAIN in P.build_gen_system("cosmetics"))
+      "službena hrvatska stranica brenda" in P.build_gen_system("cosmetics"))
 check("hijerarhija u promptu ekstrakcije",
       "PRIORITET 1" in X.build_extract_system("cosmetics"))
 
