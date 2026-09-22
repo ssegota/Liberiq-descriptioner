@@ -1,0 +1,7 @@
+[09:16:40] Proizvoda: 75 (kozmetika: 32, dodatak prehrani: 23, mliječna formula: 10, medicinski proizvod / uređaj: 10)
+[09:16:40] Generiram: both
+[09:16:40] Nedostaje u .env: BEDROCK_AWS_ACCESS_KEY_ID, BEDROCK_AWS_SECRET_ACCESS_KEY
+[09:16:40] Command exited with non-zero status 1
+[09:16:40] 2.02user 0.03system 0:00.24elapsed 830%CPU (0avgtext+0avgdata 86680maxresident)k
+[09:16:40] 0inputs+0outputs (0major+14109minor)pagefaults 0swaps
+[09:16:40] time failed with exit status 1.

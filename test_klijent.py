@@ -130,7 +130,16 @@ res = S.process_product(PROD, PAGE, BrandClient(), set(), set(), threading.Lock(
                         brand_source=S.BrandSource(url="https://solgar.com/k1",
                                                    text="Zemlja podrijetla: SAD"))
 rec = res.to_record()
-check("brend izvor -> TREBA PROVJERA", res.status == "TREBA PROVJERA")
+check("brend izvor -> status OK, oznaka u stupcima (blagi način)",
+      res.status == "OK" and rec["Napomena za provjeru"].startswith("TREBA PROVJERA"))
+S.postavi_strogi_nacin(True)
+res_strogo = S.process_product(PROD, PAGE, BrandClient(), set(), set(),
+                               threading.Lock(), 1,
+                               brand_source=S.BrandSource(url="https://solgar.hr/k1",
+                                                          text="Zemlja podrijetla: SAD"))
+check("--strogo: brend izvor -> TREBA PROVJERA",
+      res_strogo.status == "TREBA PROVJERA", f"({res_strogo.status})")
+S.postavi_strogi_nacin(False)
 check("brend izvor -> popunjeni stupci",
       rec["Izvor – brend"] == "https://solgar.com/k1" and
       "zemlja podrijetla" in rec["Preuzeto s brend stranice"] and
@@ -194,10 +203,12 @@ check("coverage: neoznačen konflikt detektiran",
       any("Konflikt izvora" in g for g in gaps_lost))
 
 # 15. placeholder umjesto vrijednosti
-md_ph = md_lost.replace("### Tab 3: Kako se koristi?",
-                        "### Tab 3: Kako se koristi?\n\nProvjeriti na pakiranju.")
+md_ph = md_lost.replace("| EAN | 3337875863377 |",
+                        "| EAN | Unijeti točno prema aktualnoj deklaraciji ili PIM-u. |")
 check("placeholder umjesto pronađene vrijednosti detektiran",
       len(X.placeholder_instead_of_value(inv, md_ph)) > 0)
+check("„Obvezna provjera prije objave“ nije lažna prijava",
+      X.placeholder_instead_of_value(inv, md_lost) == [])
 
 # 16. pipeline: ekstrakcija -> pisac -> coverage -> OK
 class PDPClient:

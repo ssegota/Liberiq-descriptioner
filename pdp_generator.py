@@ -71,6 +71,15 @@ GEN_MAX_TOKENS = 3500
 GEN_TEMPERATURE = 0.2
 VERIFY_MAX_TOKENS = 1200
 EXTRACT_MAX_TOKENS = 4000
+
+# Strogi način (--strogo): nedostatak EAN-a ili proizvođača i korištenje
+# izvora 2 sami po sebi daju TREBA PROVJERA, doslovno po uputama.
+STROGI_NACIN = False
+
+
+def postavi_strogi_nacin(vrijednost: bool) -> None:
+    global STROGI_NACIN
+    STROGI_NACIN = bool(vrijednost)
 VERIFY_TEMPERATURE = 0.0
 BEDROCK_RETRIES = 5
 
@@ -274,6 +283,7 @@ class RowResult:
     coverage: list = field(default_factory=list)
     conflicts: list = field(default_factory=list)
     nedostaje: list = field(default_factory=list)
+    info: list = field(default_factory=list)      # informativno, ne blokira
 
     def to_record(self) -> dict:
         return {
@@ -293,6 +303,7 @@ class RowResult:
                                " | ".join(self.coverage[:4])),
             "Konflikt izvora": " | ".join(self.conflicts),
             "Nedostaje": " | ".join(self.nedostaje),
+            "Informativno": " | ".join(self.info),
             "Broj izvora": len(self.sources),
             "Izvori": " | ".join(s.url for s in self.sources),
             "MD datoteka": self.md_path,
@@ -732,6 +743,36 @@ PRAVILA IZLAZA (spremno za copy/paste)
   dojenčeta.“ Početna hrana za dojenčad (0 do 6 mjeseci) bez prehrambenih i
   zdravstvenih tvrdnji.
 
+PROTUPRIMJERI (ovako NE, ovako DA)
+  NE: | EAN | 3337875863377 [S1] |
+  DA: | EAN | 3337875863377 |
+  NE: KONFLIKT SKU-a: eljekarna24 navodi C001146, druga ljekarna navodi C002360.
+  DA: (ništa u dokumentu; neslaganje ide u JSON polje "konflikti")
+  NE: tip, namjena, ciljana skupina, područje, tekstura/oblik, pakiranje
+  DA: | Tip proizvoda | krema za lice |
+  NE: Avène Sun Krema SPF50 – zaštita od sunca
+  DA: Avène Sun Krema SPF50, zaštita od sunca
+  NE: | EAN | Nije pronađeno |
+  DA: | EAN | Unijeti točno prema aktualnoj deklaraciji ili PIM-u. |
+  NE: | 66 % manje mitesera | Podaci nisu navedeni u izvoru. |
+  DA: (izostavi cijeli blok Kliničke studije)
+
+KONTROLNI POPIS PRIJE PREDAJE (provjeri svaku stavku prije nego vratiš odgovor)
+  1. Nigdje u dokumentu nema [S1], [S2], riječi KONFLIKT, „potvrditi“,
+     „provjeriti koji je ispravan“, „Prije lokalne objave“, „prema dostupnoj
+     dokumentaciji“, naziva drugih trgovina ni njihovih šifri.
+  2. Nigdje nema crtica – ni —. (Provjeri svaku rečenicu. Crtica je dopuštena
+     samo između dva broja, npr. 22–42 cm.)
+  3. Brza traka ima svih šest redaka i svaki je popunjen konkretnim podatkom.
+  4. Tablica istaknutih sastojaka ima TOČNO 3 ili 4 retka podataka. Puni sastav
+     i nutritivna tablica idu ISPOD nje, odvojeni praznim retkom.
+  5. Tab 5 ima sve retke; za podatak kojeg nema u izvorima upisan je DOSLOVNO
+     tekst iz predloška, nikad „nepoznato“ ili „nije pronađeno“.
+  6. Blok Kliničke studije postoji samo ako svaki redak ima rezultat, vrijeme,
+     broj ispitanika i metodu. U suprotnom cijeli blok NE postoji.
+  7. Dokument je potpun: svi tabovi, blok recenzija i FAQ s 3 do 5 pitanja.
+  8. Naziv proizvoda: bez crtice, bez znaka |, bez namjene, količina na kraju.
+
 NA KRAJU ODGOVORA, nakon dokumenta, u zasebnom bloku vrati JSON:
 ```json
 {{"nedostaje": ["EAN", "..."], "konflikti": ["..."], "koristeni_izvori": ["..."]}}
@@ -1071,8 +1112,11 @@ def validate_pdp(md: str, product: Product, category: str,
                 body = block_of(md, headings, headings.index(h)).strip()
                 if not body:
                     errors.append("Kratki opis je prazan.")
-                elif body.count(".") > 2:
-                    errors.append("Kratki opis mora biti jedna rečenica.")
+                else:
+                    # rečenicom se smatra točka iza koje slijedi veliko slovo
+                    recenice = len(re.findall(r"[.!?]\s+[A-ZČĆŽŠĐ]", body)) + 1
+                    if recenice > 1:
+                        errors.append("Kratki opis mora biti jedna rečenica.")
             if h["title"] == "Brza traka ispod opisa":
                 body = block_of(md, headings, headings.index(h))
                 lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
@@ -1178,8 +1222,15 @@ def validate_pdp(md: str, product: Product, category: str,
 
     # --- Zabranjeni izrazi ---
     for hit in find_forbidden(md):
+        if any(w in hit.lower() for w in
+               {x for x in norm_spaced(product.naziv).split() if len(x) > 3}):
+            continue
         errors.append(f"Zabranjeni izraz u dokumentu: {hit}.")
+    naziv_rijeci = {w for w in norm_spaced(product.naziv + " " + product.brend).split()
+                    if len(w) > 3}
     for hit in R.nadi_zabranjene_rijeci(md):
+        if any(w in hit.lower() for w in naziv_rijeci):
+            continue            # riječ je dio naziva ili brenda, ne tvrdnja
         errors.append(f"Zabranjena riječ: {hit}.")
 
     # --- Z2: interne napomene ne smiju u tekst za kupca ---
@@ -1216,8 +1267,17 @@ def validate_pdp(md: str, product: Product, category: str,
     # --- istaknuti sastojci: točno 3 ili 4 ---
     sastojci_tab = {"cosmetics": 4, "supplement": 4, "formula": 3}.get(category)
     if sastojci_tab and sastojci_tab in tab_blocks:
-        redovi = [ln for ln in tab_blocks[sastojci_tab].splitlines()
-                  if ln.strip().startswith("|") and "---" not in ln]
+        # broji se SAMO prva tablica (istaknuti sastojci); puni sastav i
+        # nutritivna tablica dolaze ispod i ne ulaze u brojanje
+        redovi, u_tablici = [], False
+        for ln in tab_blocks[sastojci_tab].splitlines():
+            je_red = ln.strip().startswith("|")
+            if je_red:
+                u_tablici = True
+                if "---" not in ln:
+                    redovi.append(ln)
+            elif u_tablici and ln.strip():
+                break
         broj = max(0, len(redovi) - 1)          # bez zaglavlja
         if redovi and not 3 <= broj <= 4:
             errors.append(f"Istaknutih sastojaka mora biti 3 ili 4 (nađeno: {broj}). "
@@ -1229,7 +1289,9 @@ def validate_pdp(md: str, product: Product, category: str,
                    if h["level"] == 2 and h["title"].startswith("4. Kliničke"))
         blok = block_of(md, headings, pos)
         for ln in blok.splitlines():
-            if not ln.strip().startswith("|") or "---" in ln or "Rezultat |" in ln:
+            if not ln.strip().startswith("|") or "---" in ln:
+                continue
+            if re.search(r"\|\s*Rezultat\s*\|", ln, re.IGNORECASE):
                 continue
             ima_broj = re.search(r"\d+\s*ispitanik", ln, re.IGNORECASE)
             ima_vrijeme = re.search(r"\d+\s*(tjedan|tjedn|dan|dana|sat|sati|mjesec)",
@@ -1271,7 +1333,12 @@ def validate_pdp(md: str, product: Product, category: str,
     # --- Brojevi s jedinicama moraju postojati u izvorima ---
     source_specs = spec_tokens(product.naziv + " " +
                                " ".join(s.text for s in sources))
+    # brojevi zapisani uz oznaku pakiranja („a18“, „x30“) vrijede kao potvrda
+    brojevi_iz_naziva = set(re.findall(r"\d+", product.naziv))
     for tok in sorted(spec_tokens(md)):
+        broj = re.match(r"[\d.]+", tok)
+        if broj and broj.group(0).rstrip(".") in brojevi_iz_naziva:
+            continue
         if tok not in source_specs:
             errors.append(f"Podatak '{tok}' ne postoji u izvorima ni u nazivu — "
                           "ukloni ga ili zamijeni potvrđenim podatkom.")
@@ -1405,7 +1472,10 @@ def process_product(product: Product, category: str, sources: list[Source],
         errors = validate_pdp(md, product, category, sources)
         if errors:
             consider(md, errors, structure_ok=False)
-            feedback = ("Greške automatske kontrole formata i sadržaja:\n"
+            feedback = ("ISPRAVI SAMO NAVEDENO i vrati CIJELI dokument s "
+                        "nepromijenjenim ostatkom. Ne preoblikuj dijelove koji "
+                        "nisu navedeni.\n"
+                        "Greške automatske kontrole formata i sadržaja:\n"
                         + "\n".join(f"- {e}" for e in errors))
             continue
 
@@ -1427,25 +1497,33 @@ def process_product(product: Product, category: str, sources: list[Source],
         if verdict.get("prolazi") and not claims:
             result.verified = "prolazi"
             if verdict.get("napomena"):
-                result.notes.append(f"kontrolor: {verdict['napomena']}")
+                result.info.append(f"kontrolor: {verdict['napomena']}")
 
             # --- COVERAGE CHECK: je li išta izgubljeno iz izvora? ---
-            gaps = []
+            gaps_sve = []
             if do_coverage and inventory is not None:
-                gaps = X.coverage_check(inventory, md) + \
+                gaps_sve = X.coverage_check(inventory, md) + \
                     X.placeholder_instead_of_value(inventory, md)
+            # blokiraju samo obvezni podaci; sporedne praznine su informativne
+            gaps = [g for g in gaps_sve
+                    if g.startswith("HARD FIELD") or g.startswith("EAN ")
+                    or "ostao placeholder" in g]
+            result.info.extend(g for g in gaps_sve if g not in gaps)
             if not gaps:
-                razlozi = []
+                razlozi, informativno = [], []
                 obvezni = [n for n in result.nedostaje
                            if re.search(r"ean|proizvo|pakiranj|sastav",
                                         str(n), re.IGNORECASE)]
                 if obvezni:
-                    razlozi.append("nedostaje obvezan podatak: "
-                                   + ", ".join(obvezni))
+                    poruka = "nedostaje obvezan podatak: " + ", ".join(obvezni)
+                    (razlozi if STROGI_NACIN else informativno).append(poruka)
                 if any(s.kind == SECONDARY_LABEL for s in sources):
-                    razlozi.append("korišten je izvor 2 (stranica brenda)")
+                    poruka = "korišten je izvor 2 (stranica brenda)"
+                    (razlozi if STROGI_NACIN else informativno).append(poruka)
                 if result.conflicts:
-                    razlozi.append("neslaganje izvora zabilježeno interno")
+                    # neslaganje je zabilježeno u stupcu Konflikti; tekst je ispravan
+                    informativno.append("neslaganje izvora zabilježeno interno")
+                result.info.extend(informativno)
                 if razlozi:
                     result.status = "TREBA PROVJERA"
                     result.notes.extend(razlozi)

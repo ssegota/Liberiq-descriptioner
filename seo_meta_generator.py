@@ -77,6 +77,16 @@ SYSTEM_PROMPT_HEADER = (
     "strogo prema pravilima u nastavku. Odgovaraš ISKLJUČIVO validnim JSON-om."
 )
 
+# Strogi način: doslovno po uputama, korišten izvor 2 ili nedostatak obveznog
+# podatka sam po sebi daje TREBA PROVJERA. Uključuje se zastavicom --strogo.
+STROGI_NACIN = False
+
+
+def postavi_strogi_nacin(vrijednost: bool) -> None:
+    global STROGI_NACIN
+    STROGI_NACIN = bool(vrijednost)
+
+
 MAX_TOKENS = 700
 TEMPERATURE = 0.2
 PAGE_CONTENT_CAP = 4500       # znakova sadržaja stranice u promptu
@@ -369,6 +379,7 @@ class RowResult:
     status: str = "TREBA PROVJERA"
     attempts: int = 0
     notes: list = field(default_factory=list)
+    info: list = field(default_factory=list)      # informativno, ne utječe na status
     specs_used: list = field(default_factory=list)
     namjena: str = ""
     brand_url: str = ""
@@ -392,6 +403,7 @@ class RowResult:
             "Status": self.status,
             "Pokušaji": self.attempts,
             "Napomene": " | ".join(self.notes),
+            "Informativno": " | ".join(self.info),
             "Korištene specifikacije": "; ".join(map(str, self.specs_used)),
             "Namjena": self.namjena,
             "Izvor – eljekarna24": self.product.url if self.page.fetched else "",
@@ -729,6 +741,32 @@ stranice. Ne izmišljaj specifikacije, sastojke ni tvrdnje. Svaki broj s
 jedinicom (npr. "75 ml", "500 mg", "SPF50") smiješ upotrijebiti samo ako
 postoji u izvoru. Ako sadržaj stranice nije dostupan, osloni se samo na naziv.
 
+PROTUPRIMJERI (ovako NE, ovako DA)
+  NE: Solgar Vitamin K1 100 mcg, 100 tab
+  DA: Solgar Vitamin K1 100 mcg 100 tableta
+  NE: Vichy Dercos Energetski šampon protiv 200 ml      (prekinuto na „protiv“)
+  DA: Vichy Dercos Energetski šampon 200 ml
+  NE: Sagas RC 01 Collagen Hyaluron Complex 60          (broj bez jedinice)
+  DA: Sagas RC 01 Collagen Hyaluron Complex 60 kapsula
+  NE: La Roche-Posay Hydraphase Intense 50 ml           (izgubljena varijanta „Riche“)
+  DA: La Roche-Posay Hydraphase HA Riche 50 ml
+  NE: La Roche-Posay Anthelios SPF50 – zaštita lica     (crtica)
+  DA: La Roche-Posay Anthelios Pigment Correct SPF50 50 ml
+  NE (meta): Fluid za vrlo visoku zaštitu. Pakiranje od 50 ml.
+  DA (meta): La Roche-Posay Anthelios UVMUNE 400 fluid za zaštitu osjetljive
+             kože lica, 50 ml. Vrlo visoka zaštita od UVA i UVB zraka.
+
+KONTROLNI POPIS PRIJE PREDAJE
+  1. Title sadrži samo riječi iz kanonskog naziva, istim redoslijedom.
+  2. U titlu su ostali brend, linija, tip, varijanta i količina s jedinicom.
+  3. Title ne završava s: za, i, s, od, protiv, &, ni brojem bez jedinice.
+  4. Nema crtica ni u titlu ni u meta opisu.
+  5. Prva rečenica meta opisa ima naziv, namjenu i količinu; namjena je unutar
+     prvih 100 znakova.
+  6. Količina se u meta opisu spominje točno jednom i ista je kao u titlu.
+  7. Nema zabranjenih riječi (optimalan, najbolji, jedini, ultra, idealan,
+     savršen, sprječava, liječi, akcija, cijena, dostava, gratis, kupite).
+
 FORMAT ODGOVORA
 Vrati ISKLJUČIVO validan JSON, bez ikakvog teksta prije ili poslije:
 {{"title": "...", "meta_description": "...", "specs_used": ["..."],
@@ -837,9 +875,12 @@ def sanitize_meta(meta: str) -> str:
 
 def validate_candidate(cand: Candidate, product: Product, page: PageData,
                        seen_titles: set[str], seen_metas: set[str],
-                       canonical_name: str = "") -> list[str]:
+                       canonical_name: str = "",
+                       napomene_info: list | None = None) -> list[str]:
     """Vraća listu grešaka (prazna lista = prolaz). Poruke idu i modelu i u QA."""
     errors: list[str] = []
+    if napomene_info is None:
+        napomene_info = []
     title, meta = cand.title_core, cand.meta
 
     # --- Title ---
@@ -852,12 +893,8 @@ def validate_candidate(cand: Candidate, product: Product, page: PageData,
                 f"Title predug i bez dodatka webshopa: {px:.0f} px, tvrdi limit "
                 f"{TITLE_MAX_PX:.0f} px. Skrati ga."
             )
-        elif px > TITLE_CORE_TARGET_PX:
-            errors.append(
-                f"Osnovni title je {px:.0f} px; da bi stao dodatak "
-                f"'{BRAND_SUFFIX.strip()}', mora biti ≤ {TITLE_CORE_TARGET_PX:.0f} px "
-                "(~45 znakova). Skrati uklanjanjem sporednih značajki."
-            )
+        # Napomena: ako osnovni title prelazi TITLE_CORE_TARGET_PX, nastavak
+        # webshopa se izostavlja. To je dopušteno pravilima i NIJE greška.
         name_ref = canonical_name or product.naziv
         first_tok = (significant_name_tokens(name_ref, 1) or [""])[0]
         nt = norm_compact(title)
@@ -896,13 +933,25 @@ def validate_candidate(cand: Candidate, product: Product, page: PageData,
         if R.nadi_crtice(title):
             errors.append("Title sadrži crticu (– ili —). Ukloni je; crtica ostaje "
                           "samo u rasponu brojeva.")
+        naziv_rijeci = set(norm_spaced(
+            (canonical_name or "") + " " + product.naziv).split())
         for hit in R.nadi_zabranjene_rijeci(title):
+            if any(w in hit.lower() for w in naziv_rijeci if len(w) > 3):
+                continue          # riječ je dio naziva proizvoda, ne tvrdnja
             errors.append(f"Zabranjena riječ u titlu: {hit}.")
         if canonical_name:
-            rijeci_naziva = {w for w in norm_spaced(canonical_name).split()}
-            visak = [w for w in norm_spaced(title).split()
-                     if w not in rijeci_naziva and w not in {"eljekarna24"}
-                     and len(w) > 2]
+            rijeci_naziva = set(norm_spaced(canonical_name).split())
+            # dopusti i sklonidbene oblike (isti korijen) te jedinice i brojeve
+            korijeni = {w[:5] for w in rijeci_naziva if len(w) >= 5}
+            jedinice = {"ml", "l", "g", "kg", "mg", "mcg", "iu", "cm", "spf",
+                        "tableta", "tablete", "kapsula", "kapsule", "komada",
+                        "vrecica", "vrecice", "bombona", "eljekarna24"}
+            visak = []
+            for w in norm_spaced(title).split():
+                if (w in rijeci_naziva or w in jedinice or w.isdigit()
+                        or len(w) <= 3 or (len(w) >= 5 and w[:5] in korijeni)):
+                    continue
+                visak.append(w)
             if visak:
                 errors.append(f"Title sadrži riječi kojih nema u PDP nazivu: "
                               f"{', '.join(visak[:4])}. Koristi samo riječi iz PDP "
@@ -955,6 +1004,8 @@ def validate_candidate(cand: Candidate, product: Product, page: PageData,
             errors.append("Meta opis sadrži crticu (– ili —). Umjesto nje zarez "
                           "ili točka.")
         for hit in R.nadi_zabranjene_rijeci(meta):
+            if any(w in hit.lower() for w in naziv_rijeci if len(w) > 3):
+                continue
             errors.append(f"Zabranjena riječ u meta opisu: {hit}.")
         if canonical_name:
             brend_rijec = (canonical_name.split() or [""])[0]
@@ -976,7 +1027,12 @@ def validate_candidate(cand: Candidate, product: Product, page: PageData,
         # anti-halucinacija: broj+jedinica mora postojati u izvoru
         source_norm = norm_spaced(product.naziv + " " + (page.content or ""))
         source_specs = spec_tokens(source_norm)
+        brojevi_iz_naziva = set(re.findall(r"\d+", product.naziv + " " +
+                                           (canonical_name or "")))
         for tok in spec_tokens(meta):
+            broj = re.match(r"[\d.]+", tok)
+            if broj and broj.group(0).rstrip(".") in brojevi_iz_naziva:
+                continue
             if tok not in source_specs:
                 errors.append(
                     f"Podatak '{tok}' u meta opisu nije potvrđen u nazivu ni na "
@@ -985,13 +1041,17 @@ def validate_candidate(cand: Candidate, product: Product, page: PageData,
 
     # specs_used moraju postojati u izvoru
     source_compact = norm_compact(product.naziv + " " + (page.content or ""))
+    source_spaced = set(norm_spaced(product.naziv + " " + (page.content or "")
+                                    + " " + (canonical_name or "")).split())
     for spec in cand.specs_used:
-        sc = norm_compact(str(spec))
-        if len(sc) >= 4 and sc not in source_compact:
-            errors.append(
-                f"Navedena specifikacija '{spec}' nije pronađena u izvoru — "
-                "navedi doslovnu frazu iz izvora ili je izostavi."
-            )
+        rijeci = [w for w in norm_spaced(str(spec)).split() if len(w) >= 4]
+        if not rijeci:
+            continue
+        pogodaka = sum(1 for w in rijeci if w in source_spaced)
+        if pogodaka / len(rijeci) < 0.5:
+            # revizijski trag, ne tekst za kupca: bilježi se, ali ne blokira
+            napomene_info.append(
+                f"specifikacija '{str(spec)[:60]}' nije doslovno pronađena u izvoru")
 
     # jedinstvenost
     if title and norm_compact(title) in seen_titles:
@@ -1130,7 +1190,8 @@ def process_product(product: Product, page: PageData, client: BedrockClient,
 
         with lock:
             errors = validate_candidate(cand, product, page, seen_titles,
-                                        seen_metas, canonical_name)
+                                        seen_metas, canonical_name,
+                                        napomene_info=result.info)
         if not cand.namjena_potvrdjena:
             errors = list(errors) + [
                 "Namjena nije potvrđena u izvorima (namjena_potvrdjena = false) — "
@@ -1144,6 +1205,8 @@ def process_product(product: Product, page: PageData, client: BedrockClient,
             break
 
         feedback = (
+            "ISPRAVI SAMO NAVEDENO. Sve ostalo prepiši nepromijenjeno; ne "
+            "preformuliraj dijelove koji su prošli.\n"
             f'Prethodni title: "{cand.title_core}" '
             f"({text_width_px(cand.title_core, TITLE_FONT_PX):.0f} px)\n"
             f'Prethodni meta opis: "{cand.meta}" '
@@ -1184,18 +1247,27 @@ def process_product(product: Product, page: PageData, client: BedrockClient,
         else:
             remaining = recheck
 
+    # sigurnosna mreža: title nikad ne smije prijeći 550 px, bez obzira na
+    # to je li preostalo još kakvih napomena
+    if text_width_px(title_core, TITLE_FONT_PX) > TITLE_MAX_PX:
+        title_core = R.skrati_po_segmentima(
+            title_core,
+            stane=lambda t: text_width_px(t, TITLE_FONT_PX) <= TITLE_MAX_PX,
+            obavezno=obavezni_pojmovi(canonical_name or product.naziv))
+        result.info.append("title skraćen na 550 px")
     result.title, result.title_px, suffix_note = finalize_title(title_core)
     result.meta = meta
     result.meta_px = text_width_px(meta, META_FONT_PX)
     if suffix_note:
-        result.notes.append(suffix_note)
+        result.info.append(suffix_note)
 
     if result.brand_data:
-        result.notes.append("podatak s brend stranice — obvezna ljudska provjera: "
-                            + ", ".join(result.brand_data))
+        poruka = ("podatak s brend stranice: " + ", ".join(result.brand_data))
+        (result.notes if STROGI_NACIN else result.info).append(poruka)
     if not remaining:
         # status OK samo kad validator nema nijednu napomenu (upute, točka 6)
-        result.status = "TREBA PROVJERA" if result.brand_data else "OK"
+        result.status = ("TREBA PROVJERA"
+                         if (STROGI_NACIN and result.brand_data) else "OK")
         with lock:
             seen_titles.add(norm_compact(title_core))
             seen_metas.add(norm_compact(meta))

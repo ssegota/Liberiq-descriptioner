@@ -1,0 +1,15 @@
+[09:06:05] Proizvoda: 75 (kozmetika: 32, dodatak prehrani: 23, mliječna formula: 10, medicinski proizvod / uređaj: 10)
+[09:06:05] Generiram: both
+[09:06:05] Model (pisac):     eu.anthropic.claude-opus-4-1-20250805-v1:0
+[09:06:05] Model (kontrolor): eu.anthropic.claude-opus-4-1-20250805-v1:0
+[09:06:05] Regija:            eu-north-1
+[09:06:05] 
+[09:06:10] 
+[09:06:10] Bedrock greška:
+[09:06:10]   [ValidationException] The provided model identifier is invalid.
+[09:06:10]   -> Najčešće pogrešan model ID; provjeri: aws bedrock list-inference-profiles --region eu-north-1
+[09:06:10] Obrađeno je spremljeno u results.jsonl — ponovno pokretanje nastavlja gdje je stalo.
+[09:06:10] Command exited with non-zero status 1
+[09:06:10] 2.42user 0.07system 0:05.72elapsed 43%CPU (0avgtext+0avgdata 141744maxresident)k
+[09:06:10] 392inputs+0outputs (0major+25733minor)pagefaults 0swaps
+[09:06:10] time failed with exit status 1.

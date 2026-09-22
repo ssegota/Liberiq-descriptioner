@@ -68,14 +68,22 @@ HARD_FIELDS = {"doza", "puni_sastav", "aktivne_tvari", "aktivni_sastojci",
                "nacin_uporabe", "upozorenja", "identifikatori", "specifikacije",
                "dobna_faza"}
 
+# Polja koja blokiraju i kad nemaju brojeva: gubitak sastava ili doze je
+# najteži propust iz audita. Ostala tvrda polja su prozna (upute, upozorenja)
+# pa ih model prevodi i preoblikuje, što doslovno podudaranje ne može mjeriti.
+UVIJEK_TVRDA = {"puni_sastav", "aktivne_tvari", "aktivni_sastojci",
+                "identifikatori", "doza", "dobna_faza"}
+
 STATUS_FOUND = "FOUND"
 STATUS_NOT_FOUND = "NOT FOUND"
 STATUS_CONFLICT = "CONFLICT"
 STATUS_DERIVED = "DERIVED"
 
+# Samo doslovni placeholderi iz klijentovih predložaka. Rečenice tipa
+# "Obvezna provjera prije objave" dio su predloška i NISU placeholder.
 PLACEHOLDER_HINTS = [
-    "provjerit", "provjeri na pakiranju", "provjeriti na deklaraciji",
-    "unijeti točno prema", "navesti samo ako", "prema aktualnoj deklaraciji ili pim",
+    "unijeti točno prema aktualnoj deklaraciji ili pim",
+    "navesti samo ako je potvrđena",
 ]
 
 
@@ -260,6 +268,18 @@ def _key_bits(value: str) -> list[str]:
     return bits
 
 
+SKU_RE = re.compile(r"\b[A-Z]{1,3}\d{5,8}\b")
+
+
+def _ocisti_identifikatore(vrijednost: str) -> str:
+    """Iz identifikatora zadrži samo EAN/UPC znamenke.
+
+    Interne šifre trgovina (SKU) ne ulaze u PDP po uputama, pa se ne
+    provjeravaju niti smatraju izgubljenim podatkom.
+    """
+    return " ".join(re.findall(r"\b\d{8,14}\b", vrijednost or ""))
+
+
 def coverage_check(inv: Inventory, md: str) -> list[str]:
     """Vrati popis pronađenih podataka koji NISU završili u finalnom PDP-u."""
     problems: list[str] = []
@@ -267,14 +287,39 @@ def coverage_check(inv: Inventory, md: str) -> list[str]:
     md_low = md.lower()
 
     for fact in inv.found():
+        if fact.polje == "identifikatori":
+            ean = _ocisti_identifikatore(fact.vrijednost)
+            if not ean:
+                continue                       # nema EAN-a, samo SKU: preskoči
+            if not any(d in md_norm for d in ean.split()):
+                problems.append(
+                    "EAN pronađen u izvorima nije prenesen u Tab 5: "
+                    f"{ean}.")
+            continue
         bits = _key_bits(fact.vrijednost)
         if not bits:
             bits = [fact.vrijednost[:40]]
-        hit = sum(1 for b in bits if _norm(b) and _norm(b) in md_norm)
+        def _nadjen(b: str) -> bool:
+            nb = _norm(b)
+            if not nb:
+                return False
+            if nb in md_norm:
+                return True
+            # raspon zapisan riječima: „6–12 mjeseci“ vs „6 do 12 mjeseci“
+            brojevi = re.findall(r"\d+", b)
+            if len(brojevi) >= 2:
+                return all(br in md_norm for br in brojevi)
+            return False
+
+        hit = sum(1 for b in bits if _nadjen(b))
         ratio = hit / len(bits) if bits else 1.0
-        threshold = 0.6 if fact.is_hard else 0.34
+        # prozni sadržaj (upute, namjena, svojstva) model prevodi i preoblikuje,
+        # pa se blokirajućim smatra samo gubitak konkretnih vrijednosti
+        ima_konkretno = bool(re.search(r"\d", fact.vrijednost or ""))
+        tvrdo = fact.is_hard and (fact.polje in UVIJEK_TVRDA or ima_konkretno)
+        threshold = 0.6 if tvrdo else 0.34
         if ratio < threshold:
-            label = "HARD FIELD" if fact.is_hard else "podatak"
+            label = "HARD FIELD" if tvrdo else "podatak"
             problems.append(
                 f"{label} '{fact.polje}' pronađen u izvorima "
                 f"({fact.vrijednost[:110]}...) nije prenesen u PDP — prenesi ga "
@@ -311,20 +356,43 @@ def coverage_check(inv: Inventory, md: str) -> list[str]:
     return problems
 
 
+# Polje iz inventara -> naziv retka u Tab 5 u kojem se očekuje vrijednost
+POLJE_U_REDAK = {
+    "identifikatori": "ean",
+    "proizvodjac": "proizvođač",
+    "pakiranje": "pakiranje",
+}
+
+
 def placeholder_instead_of_value(inv: Inventory, md: str) -> list[str]:
-    """Hard field ima vrijednost, a PDP na tom mjestu nudi 'provjeriti…'."""
+    """Placeholder na mjestu gdje izvor ima konkretnu vrijednost.
+
+    Provjerava se SAMO redak tablice u kojem bi vrijednost trebala stajati,
+    a ne cijeli dokument (inače „Obvezna provjera prije objave“ iz predloška
+    okida na svakom proizvodu).
+    """
     out = []
-    md_low = md.lower()
     for fact in inv.found():
-        if not fact.is_hard:
+        redak_naziv = POLJE_U_REDAK.get(fact.polje)
+        if not redak_naziv:
             continue
-        bits = [b for b in _key_bits(fact.vrijednost) if _norm(b)]
-        present = any(_norm(b) in _norm(md) for b in bits[:3])
-        if present:
+        vrijednost = (_ocisti_identifikatore(fact.vrijednost)
+                      if fact.polje == "identifikatori" else fact.vrijednost)
+        if not vrijednost.strip():
             continue
-        if any(h in md_low for h in PLACEHOLDER_HINTS):
-            out.append(
-                f"'{fact.polje}' je pronađen u izvorima, ali je u PDP-u zamijenjen "
-                "općom napomenom tipa „provjeriti na pakiranju“ — konkretna "
-                "vrijednost ima prednost pred placeholderom.")
+        for redak in md.splitlines():
+            if not redak.strip().startswith("|"):
+                continue
+            if redak_naziv not in redak.lower():
+                continue
+            celije = [c.strip() for c in redak.strip().strip("|").split("|")]
+            sadrzaj = " ".join(celije[1:]).lower()
+            ima_placeholder = any(h in sadrzaj for h in PLACEHOLDER_HINTS)
+            ima_vrijednost = any(_norm(b) and _norm(b) in _norm(sadrzaj)
+                                 for b in (_key_bits(vrijednost) or [vrijednost]))
+            if ima_placeholder and not ima_vrijednost:
+                out.append(
+                    f"„{redak_naziv}“ je pronađen u izvorima ({vrijednost[:40]}), "
+                    "ali je u Tabu 5 ostao placeholder. Upiši konkretnu vrijednost.")
+            break
     return out

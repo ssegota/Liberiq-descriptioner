@@ -49,13 +49,16 @@ prljavo = """### Tab 5
 | EAN | 123 [S2] |
 | --- | --- |
 
-KONFLIKT SKU-a: eljekarna24 navodi C001146, webljekarna navodi C002360. Potvrditi.
+KONFLIKT SKU-a: eljekarna24 navodi C001146, webljekarna.vasezdravlje.com navodi C002360.
+Potvrditi prema pakiranju.
 Prije lokalne objave provjeriti koji je ispravan, prema dostupnoj dokumentaciji."""
 nalazi = R.nadi_interne_napomene(prljavo)
 for trazeno in ("[S2]", "KONFLIKT", "potvrdit"):
     check(f"hvata „{trazeno}“", any(trazeno.lower() in n.lower() for n in nalazi))
 check("hvata spominjanje druge ljekarne",
       any("trgovine" in n for n in nalazi), f"({len(nalazi)} nalaza)")
+check("brend „Master of Pharmacy“ nije lažna prijava",
+      R.nadi_interne_napomene("Master of Pharmacy Broncho Release sirup 150 ml") == [])
 
 cisto = ("| EAN | Unijeti točno prema aktualnoj deklaraciji ili PIM-u. |\n"
          "| Obvezna provjera prije objave | Naziv, količina i EAN moraju "

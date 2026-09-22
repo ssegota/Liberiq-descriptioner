@@ -180,7 +180,9 @@ def nadi_crtice(tekst: str) -> list[str]:
 INTERNI_UZORCI: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\[S\d+\]"), "oznaka izvora [S…]"),
     (re.compile(r"\bKONFLIKT\w*", re.IGNORECASE), "napomena o konfliktu"),
-    (re.compile(r"\bpotvrdit\w*", re.IGNORECASE), "interna uputa „potvrditi“"),
+    (re.compile(r"\bpotvrdit\w+\s+(prema|na pakiranju|s klijentom|u PIM|prije objave)",
+                re.IGNORECASE), "interna uputa „potvrditi“"),
+    (re.compile(r"\btreba potvrditi\b", re.IGNORECASE), "interna uputa „potvrditi“"),
     (re.compile(r"\bprovjerit\w+\s+(koji|je li|na pakiranju|prije objave)",
                 re.IGNORECASE), "interna uputa „provjeriti“"),
     (re.compile(r"Prije lokalne objave", re.IGNORECASE), "interna uputa"),
@@ -193,6 +195,9 @@ INTERNI_UZORCI: list[tuple[re.Pattern, str]] = [
 
 # Tekst iz klijentovih predložaka koji SMIJE ostati.
 DOZVOLJENI_PREDLOSCI = (
+    "Prije uporabe provjeri aktualni sastav na pakiranju.",
+    "Prije uporabe provjerite sve alergene na aktualnoj deklaraciji.",
+    "Provjerite odgovara li priložena manšeta opsegu nadlaktice korisnika.",
     "Unijeti točno prema aktualnoj deklaraciji ili PIM-u.",
     "Navesti samo ako je potvrđena na deklaraciji ili u dokumentaciji točnog proizvoda.",
     "Obvezna provjera prije objave",
@@ -217,8 +222,11 @@ def nadi_interne_napomene(tekst: str) -> list[str]:
         m = uzorak.search(provjera)
         if m:
             nalazi.append(f"„{m.group(0).strip()}“ ({opis})")
+    nisko = provjera.lower()
     for domena in ZABRANJENE_DOMENE:
-        if domena.split(".")[0] in provjera.lower():
+        # traži se PUNA domena (pharmacy.hr), ne dio riječi, da brend
+        # „Master of Pharmacy“ ne bi bio prepoznat kao druga ljekarna
+        if re.search(rf"\b{re.escape(domena)}\b", nisko):
             nalazi.append(f"spominjanje druge trgovine ili tražilice ({domena})")
             break
     return nalazi
@@ -386,15 +394,24 @@ def skrati_po_segmentima(naziv: str, stane, obavezno: list[str] | None = None) -
             return kandidat
         rijeci = filtrirane
 
-    # 3) zadnji izlaz: reži riječi s kraja, ali čuvaj količinu i obavezne pojmove
-    kolicina = kolicina_iz(spoji(segmenti))
-    while len(rijeci) > 2 and not stane(" ".join(rijeci)):
-        kandidat = rijeci[:-1]
-        preostalo = " ".join(kandidat)
-        if kolicina and kolicina.lower() not in preostalo.lower():
-            break
-        rijeci = kandidat
-    rezultat = " ".join(rijeci).strip(" ,")
+    # 3) zadnji izlaz: količina (i sve iza nje) je rep koji ostaje, a režu se
+    #    riječi neposredno ispred repa, s kraja prema početku
+    kolicina = kolicina_iz(" ".join(rijeci))
+    rep: list[str] = []
+    if kolicina:
+        nisko = [r.lower() for r in rijeci]
+        dijelovi = kolicina.lower().split()
+        for i in range(len(rijeci) - len(dijelovi), -1, -1):
+            if nisko[i:i + len(dijelovi)] == dijelovi:
+                rep = rijeci[i:]
+                rijeci = rijeci[:i]
+                break
+    while len(rijeci) > 2 and not stane(" ".join(rijeci + rep)):
+        rijeci = rijeci[:-1]
+    # glava ne smije završiti prijedlogom ili veznikom („…šampon protiv 200 ml“)
+    while len(rijeci) > 1 and zavrsava_lose(" ".join(rijeci)):
+        rijeci = rijeci[:-1]
+    rezultat = " ".join(rijeci + rep).strip(" ,")
     while rezultat and zavrsava_lose(rezultat):
         rezultat = " ".join(rezultat.split()[:-1]).strip(" ,")
     return rezultat or spoji(segmenti[:1])

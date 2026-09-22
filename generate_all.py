@@ -99,6 +99,7 @@ def brand_source_for(sources, brend: str):
 
 SEO_COLS = ["Title tag", "Title px", "Title znakova", "Meta opis", "Meta px",
             "Meta znakova", "Namjena", "Status", "Pokušaji", "Napomene",
+            "Informativno",
             "Korištene specifikacije", "Izvor – eljekarna24", "Izvor – brend",
             "Preuzeto s brend stranice", "Napomena za provjeru",
             "Postojeći title (QA)", "Postojeći meta (QA)"]
@@ -186,10 +187,10 @@ def write_interni_file(records: list[dict], out_dir: Path):
 
     redci = []
     for r in records:
-        napomene = " | ".join(x for x in (r.get("SEO Napomene", ""),
-                                          r.get("PDP Napomene", ""),
-                                          r.get("PDP Coverage check", "")) if x
-                              and x != "prolazi")
+        napomene = " | ".join(
+            x for x in (r.get("SEO Napomene", ""), r.get("PDP Napomene", ""),
+                        r.get("PDP Coverage check", ""))
+            if x and x != "prolazi" and not str(x).startswith("kontrolor:"))
         redci.append({
             "Sekcija": r.get("Sekcija", ""), "Brend": r.get("Brend", ""),
             "SKU": r.get("SKU", ""), "Naziv": r.get("Naziv", ""),
@@ -271,7 +272,10 @@ def parse_args() -> argparse.Namespace:
                     help="što generirati (zadano: both)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--sku", action="append", default=[])
-    ap.add_argument("--max-attempts", type=int, default=3)
+    ap.add_argument("--max-attempts", type=int, default=4)
+    ap.add_argument("--strogo", action="store_true",
+                    help="doslovno po uputama: nedostatak EAN-a ili proizvođača "
+                         "i korištenje izvora 2 daju TREBA PROVJERA")
     ap.add_argument("--search-results", type=int, default=3)
     ap.add_argument("--no-web-search", action="store_true")
     ap.add_argument("--no-secondary", action="store_true",
@@ -306,6 +310,9 @@ def main() -> None:
     aktivne = prompts_cfg.active()
     if aktivne:
         print(f"Promptovi iz mape {args.prompts_dir}/: {', '.join(aktivne)}")
+
+    S.postavi_strogi_nacin(args.strogo)
+    P.postavi_strogi_nacin(args.strogo)
 
     products = P.load_products(Path(args.input))
     if args.sku:
@@ -457,6 +464,10 @@ def main() -> None:
     print(f"Za klijenta: {klijent_path}")
     print(f"Interno:     {interni_path}")
     print(f"Puni indeks: {xlsx_path}")
+    if razlozi:
+        print("\nNajčešći razlozi za TREBA PROVJERA:")
+        for oznaka, broj in sorted(razlozi.items(), key=lambda x: -x[1])[:8]:
+            print(f"  {broj:4d}x  {oznaka}")
     if len(ordered) - ok:
         print("Retke koji nisu OK regeneriraj s: --retry-review (ili --sku <SKU>).")
 
