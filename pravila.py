@@ -406,6 +406,18 @@ def skrati_po_segmentima(naziv: str, stane, obavezno: list[str] | None = None) -
                 rep = rijeci[i:]
                 rijeci = rijeci[:i]
                 break
+    # Reži po CIJELIM prijedložnim frazama, nikad usred fraze:
+    # „Krema SPF50 za suhu i osjetljivu kožu lica 50 ml“
+    #   -> „Krema SPF50 50 ml“, a ne „Krema SPF50 za suhu 50 ml“.
+    PRIJEDLOZI = {"za", "s", "sa", "od", "protiv", "u", "na", "iz", "bez",
+                  "uz", "prema", "kod", "po"}
+    while not stane(" ".join(rijeci + rep)):
+        granice = [i for i, w in enumerate(rijeci)
+                   if w.lower().strip(",.") in PRIJEDLOZI and i > 0]
+        if not granice:
+            break
+        rijeci = rijeci[:granice[-1]]
+    # tek ako ni to nije dovoljno, miču se pojedinačne riječi s kraja
     while len(rijeci) > 2 and not stane(" ".join(rijeci + rep)):
         rijeci = rijeci[:-1]
     # glava ne smije završiti prijedlogom ili veznikom („…šampon protiv 200 ml“)

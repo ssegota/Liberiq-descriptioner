@@ -688,6 +688,11 @@ PRAVILA ZA TITLE TAG
    frazu na pola.
 5i. Title ne završava prijedlogom, veznikom ni znakom (za, i, s, od, protiv, &)
    ni brojem bez jedinice.
+5i2. NIKAD NE SKRAĆUJ RIJEČI I NE IZMIŠLJAJ KRAĆE OBLIKE. Zabranjeno je
+   „štapiću“ pisati kao „štiku“, „kapsula“ kao „kaps“ ili spajati riječi.
+   Svaka riječ u titlu mora biti napisana u punom, ispravnom obliku, točno
+   kako se pojavljuje u nazivu ili u izvoru. Ako ne stane, ukloni CIJELI
+   segment, a preostale riječi ostavi nedirnute.
 5j. BEZ CRTICA (– i —) u titlu i meta opisu. Umjesto njih zarez ili točka.
 5k. NIKAD DEFINITIVNI IZRAZI koji nisu specifično dokazani u izvorima:
    "najbolji", "najučinkovitiji", "najsigurniji", "jedini", "zlatni standard",
@@ -934,7 +939,8 @@ def validate_candidate(cand: Candidate, product: Product, page: PageData,
             errors.append("Title sadrži crticu (– ili —). Ukloni je; crtica ostaje "
                           "samo u rasponu brojeva.")
         naziv_rijeci = set(norm_spaced(
-            (canonical_name or "") + " " + product.naziv).split())
+            (canonical_name or "") + " " + product.naziv + " " +
+            (page.content or "")[:400]).split())
         for hit in R.nadi_zabranjene_rijeci(title):
             if any(w in hit.lower() for w in naziv_rijeci if len(w) > 3):
                 continue          # riječ je dio naziva proizvoda, ne tvrdnja
@@ -956,6 +962,22 @@ def validate_candidate(cand: Candidate, product: Product, page: PageData,
                 errors.append(f"Title sadrži riječi kojih nema u PDP nazivu: "
                               f"{', '.join(visak[:4])}. Koristi samo riječi iz PDP "
                               "naziva, istim redoslijedom.")
+        # zaštita od rezanja riječi: svaka riječ mora postojati u nazivu,
+        # kanonskom nazivu ili na stranici proizvoda
+        rjecnik_izvora = set(norm_spaced(
+            product.naziv + " " + product.brend + " " + (canonical_name or "") +
+            " " + (page.content or "")).split())
+        for w in norm_spaced(title).split():
+            if len(w) < 4 or w.isdigit() or w in rjecnik_izvora:
+                continue
+            if any(v.startswith(w) or w.startswith(v) for v in rjecnik_izvora
+                   if len(v) >= 4):
+                continue
+            errors.append(
+                f"Riječ „{w}“ ne postoji u nazivu ni u izvoru. Riječi se NIKAD "
+                "ne skraćuju ni ne izmišljaju (npr. „štapiću“ u „štiku“); ako "
+                "ne stane, ukloni cijeli segment.")
+            break
         for hit in find_forbidden(title):
             errors.append(f"Zabranjeni izraz u titlu: {hit}.")
 
@@ -1246,6 +1268,26 @@ def process_product(product: Product, page: PageData, client: BedrockClient,
             result.notes.append("automatski skraćeno na limit")
         else:
             remaining = recheck
+
+    # pokušaj uklopiti nastavak webshopa uklanjanjem SPOREDNOG segmenta;
+    # ako to nije moguće bez gubitka obveznih dijelova, title ostaje bez nastavka
+    if TITLE_CORE_TARGET_PX < text_width_px(title_core, TITLE_FONT_PX) <= TITLE_MAX_PX:
+        kandidat = R.skrati_po_segmentima(
+            title_core,
+            stane=lambda t: text_width_px(t, TITLE_FONT_PX) <= TITLE_CORE_TARGET_PX,
+            obavezno=obavezni_pojmovi(canonical_name or product.naziv))
+        if (kandidat and text_width_px(kandidat, TITLE_FONT_PX) <= TITLE_CORE_TARGET_PX
+                and not R.zavrsava_lose(kandidat)
+                and R.kolicina_iz(kandidat) == R.kolicina_iz(title_core)):
+            with lock:
+                provjera = validate_candidate(
+                    Candidate(title_core=kandidat, meta=meta,
+                              specs_used=best.specs_used, namjena=best.namjena),
+                    product, page, seen_titles, seen_metas, canonical_name,
+                    napomene_info=[])
+            if not provjera:
+                title_core = kandidat
+                result.info.append("title skraćen da stane nastavak webshopa")
 
     # sigurnosna mreža: title nikad ne smije prijeći 550 px, bez obzira na
     # to je li preostalo još kakvih napomena

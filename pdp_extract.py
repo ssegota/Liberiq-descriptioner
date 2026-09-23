@@ -297,6 +297,12 @@ def coverage_check(inv: Inventory, md: str) -> list[str]:
                     f"{ean}.")
             continue
         bits = _key_bits(fact.vrijednost)
+        # popis odvojen zarezima (sastojci, dobne faze) -> usporedi po stavkama
+        if "," in (fact.vrijednost or ""):
+            stavke = [s.strip() for s in re.split(r"[,;]", fact.vrijednost)
+                      if len(s.strip()) >= 4]
+            if len(stavke) >= 2:
+                bits = [re.sub(r"\(.*?\)", " ", s).strip()[:28] for s in stavke]
         if not bits:
             bits = [fact.vrijednost[:40]]
         def _nadjen(b: str) -> bool:
@@ -317,7 +323,7 @@ def coverage_check(inv: Inventory, md: str) -> list[str]:
         # pa se blokirajućim smatra samo gubitak konkretnih vrijednosti
         ima_konkretno = bool(re.search(r"\d", fact.vrijednost or ""))
         tvrdo = fact.is_hard and (fact.polje in UVIJEK_TVRDA or ima_konkretno)
-        threshold = 0.6 if tvrdo else 0.34
+        threshold = 0.5 if tvrdo else 0.34
         if ratio < threshold:
             label = "HARD FIELD" if tvrdo else "podatak"
             problems.append(

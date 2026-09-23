@@ -6,6 +6,7 @@ import sys
 import threading
 
 import generate_all as A
+import pdp_extract as X
 import pdp_generator as P
 import pdp_templates as T
 import pravila as R
@@ -264,6 +265,53 @@ check("RC-01 -> RC 01", "RC 01" in R.primijeni_rjecnik("Sagas RC-01 Collagen"))
 check("Urea Repair -> UreaRepair", "UreaRepair" in R.primijeni_rjecnik("Eucerin Urea Repair"))
 check("la roche posay -> La Roche-Posay",
       "La Roche-Posay" in R.primijeni_rjecnik("la roche posay Effaclar"))
+
+
+print("\n=== Ispravci nakon drugog testnog runa ===")
+
+# rezanje riječi (u štapiću -> u štiku) mora biti odbijeno
+prod_b = S.Product("Kozmetika", "Avène", "C002170",
+                   "Avene Cold Cream Nutrition balzam za usne",
+                   "https://eljekarna24.hr/x/")
+page_b = S.PageData(fetched=True, content=(
+    "Cold Cream Nutrition balzam za usne u štapiću, hranjivi, za suhe i "
+    "ispucale usne, za cijelu obitelj od 2 godine."))
+canon_b = "Avène Cold Cream Nutrition hranjivi balzam za usne u štapiću"
+lose = S.Candidate(title_core="Avène Cold Cream Nutrition balzam za usne u štiku",
+                   meta="Avène Cold Cream Nutrition balzam za usne za suhe usne. "
+                        "Hranjiva njega.", namjena="za suhe usne")
+check("odbija skraćenu riječ („štiku“)",
+      any("ne postoji u nazivu" in e for e in
+          S.validate_candidate(lose, prod_b, page_b, set(), set(), canon_b)))
+
+# skraćivanje ne reže usred fraze
+t = "Avène Sun Krema SPF50 za suhu i osjetljivu kožu lica 50 ml"
+k = R.skrati_po_segmentima(t, stane=lambda x: S.text_width_px(x, 20) <= 430,
+                           obavezno=S.obavezni_pojmovi(t))
+check("reže cijelu prijedložnu frazu, ne dio",
+      "za suhu" not in k and "50 ml" in k, f"({k})")
+
+# EAN iz inventara automatski ide u Tab 5
+inv_ean = X.parse_inventory(json.dumps({"cinjenice": [
+    {"polje": "identifikatori", "vrijednost": "EAN 3282770149487",
+     "izvor": "[S1]", "status": "FOUND"}]}, ensure_ascii=False), "cosmetics")
+md_ph = T.EXAMPLES["cosmetics"].replace(
+    "| EAN | 3337875863377 |",
+    "| EAN | Unijeti točno prema aktualnoj deklaraciji ili PIM-u. |")
+novi, upisano = P.upisi_ean(md_ph, inv_ean)
+check("EAN iz izvora automatski upisan", upisano and "3282770149487" in novi)
+
+# popis sastojaka: podudaranje po stavkama
+inv_lista = X.parse_inventory(json.dumps({"cinjenice": [
+    {"polje": "aktivni_sastojci",
+     "vrijednost": "Niacinamid, Glicerin (navedeni implicitno kroz opis), Zinc PCA",
+     "izvor": "[S1]", "status": "FOUND"}]}, ensure_ascii=False), "cosmetics")
+check("popis sastojaka se uspoređuje po stavkama",
+      not any(g.startswith("HARD FIELD") for g in
+              X.coverage_check(inv_lista, T.EXAMPLES["cosmetics"])))
+
+# blagi način: nedostatak EAN-a ne obara status
+check("blagi način je zadani", P.STROGI_NACIN is False and S.STROGI_NACIN is False)
 
 print()
 if FAILURES:

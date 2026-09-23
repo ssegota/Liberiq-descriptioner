@@ -825,7 +825,7 @@ PRAVILA FORMATA (apsolutna)
 {tabs}
 4. "Brza traka ispod opisa" sadrži točno ovu liniju polja: "{t['brza_traka']}"
    i nakon nje 3–4 natuknice ključnih prednosti.
-5. Tab 1 ima 80–150 riječi i počinje situacijom kupca.
+5. Tab 1 ima 80 do 150 riječi, ciljaj 110 do 130 riječi da se izbjegne granični promašaj. Počinje situacijom kupca.
 6. Tab 5 obvezno sadrži tablicu s redcima: Pakiranje, Brend, Proizvođač,
    Zemlja podrijetla, EAN i "Obvezna provjera prije objave", plus upozorenja
    iz deklaracije kao zasebne rečenice.
@@ -894,10 +894,23 @@ proizvodu (sastojci, brojke, doze, namjena, dobne granice, sadržaj pakiranja,
 tehnologije, EAN, proizvođač, rezultati ispitivanja): je li potkrijepljena
 izvorima ili nazivom proizvoda?
 
-NE prijavljuj: opće upute sigurnog korištenja, standardna upozorenja kategorije,
-placeholder rečenice ("Unijeti točno prema aktualnoj deklaraciji ili PIM-u.",
-"Navesti samo ako je potvrđena..."), fiksne blokove (Tab 6, recenzije) ni
-formulacije s ogradom koje ne unose novu činjenicu.
+NE prijavljuj:
+- opće upute sigurnog korištenja i standardna upozorenja kategorije;
+- placeholder rečenice ("Unijeti točno prema aktualnoj deklaraciji ili PIM-u.",
+  "Navesti samo ako je potvrđena...") i fiksne blokove (Tab 6, recenzije);
+- formulacije s ogradom koje ne unose novu činjenicu;
+- OČITE IZVEDENICE iz naziva i tipa proizvoda. Ako je proizvod krema za lice,
+  onda „područje primjene: lice“, „tip proizvoda: krema“ i „ciljana skupina:
+  odrasli“ NISU tvrdnje koje treba prijaviti. Isto vrijedi za polja brze trake
+  koja logično slijede iz naziva, oblika ili pakiranja;
+- preoblikovane opise svojstava koji prenose isto značenje kao izvor drugim
+  riječima (npr. izvor kaže „lagana tekstura koja se brzo upija“, tekst kaže
+  „baršunasta tekstura koja se brzo upija“) ako nema nove činjenice;
+- prijevod sadržaja s izvora na hrvatski.
+
+PRIJAVLJUJ samo tvrdnje koje unose NOVU činjenicu koje nema u izvorima:
+izmišljene sastojke, brojke, doze, dobne granice, tehnologije, rezultate
+ispitivanja, identifikatore i tvrdnje o učinku kojih nema u izvoru.
 
 Odgovori ISKLJUČIVO validnim JSON-om, bez ikakvog drugog teksta:
 {"prolazi": true/false,
@@ -980,6 +993,34 @@ def odvoji_json_blok(raw: str) -> tuple[str, dict]:
                 podaci = {}
             raw = raw[:m2.start()].rstrip()
     return raw, podaci
+
+
+def upisi_ean(md: str, inventory) -> tuple[str, bool]:
+    """Ako je EAN potvrđen u izvorima, a u Tabu 5 je ostao placeholder,
+    upiši ga. Deterministički, bez novog poziva modelu."""
+    if inventory is None:
+        return md, False
+    ean = ""
+    for fact in inventory.found():
+        if fact.polje == "identifikatori":
+            znamenke = re.findall(r"\b\d{8,14}\b", fact.vrijednost or "")
+            if znamenke:
+                ean = znamenke[0]
+                break
+    if not ean or ean in md:
+        return md, False
+    novi = []
+    upisano = False
+    for redak in md.splitlines():
+        if (not upisano and redak.strip().startswith("|")
+                and re.search(r"\|\s*EAN[^|]*\|", redak, re.IGNORECASE)):
+            celije = redak.strip().strip("|").split("|")
+            if len(celije) >= 2 and not re.search(r"\d{8,14}", celije[1]):
+                celije[1] = f" {ean} "
+                redak = "|" + "|".join(celije) + "|"
+                upisano = True
+        novi.append(redak)
+    return "\n".join(novi), upisano
 
 
 def clean_markdown(raw: str) -> str:
@@ -1226,8 +1267,11 @@ def validate_pdp(md: str, product: Product, category: str,
                {x for x in norm_spaced(product.naziv).split() if len(x) > 3}):
             continue
         errors.append(f"Zabranjeni izraz u dokumentu: {hit}.")
-    naziv_rijeci = {w for w in norm_spaced(product.naziv + " " + product.brend).split()
-                    if len(w) > 3}
+    # riječ koja je dio naziva, brenda ili naziva linije na stranici proizvoda
+    # nije tvrdnja (npr. „Intense Protect“, „Ultra“, „Optimal“)
+    izvor_naziva = product.naziv + " " + product.brend + " " + " ".join(
+        s.text[:300] for s in sources if s.kind == "stranica proizvoda")
+    naziv_rijeci = {w for w in norm_spaced(izvor_naziva).split() if len(w) > 3}
     for hit in R.nadi_zabranjene_rijeci(md):
         if any(w in hit.lower() for w in naziv_rijeci):
             continue            # riječ je dio naziva ili brenda, ne tvrdnja
@@ -1434,10 +1478,16 @@ def process_product(product: Product, category: str, sources: list[Source],
     # --- 1. STRUKTURIRANA EKSTRAKCIJA PRIJE PISANJA ---
     inventory = None
     if do_extract and sources:
-        raw_inv = client.extract(X.build_extract_system(category),
-                                 X.build_extract_user(product,
-                                                      sources_block(sources)))
-        inventory = X.parse_inventory(raw_inv, category)
+        inventory = None
+        for pokusaj in range(2):
+            raw_inv = client.extract(
+                X.build_extract_system(category),
+                X.build_extract_user(product, sources_block(sources))
+                + ("\n\nPRETHODNI ODGOVOR NIJE BIO VALJAN JSON. Vrati "
+                   "ISKLJUČIVO JSON, bez teksta okolo." if pokusaj else ""))
+            inventory = X.parse_inventory(raw_inv, category)
+            if inventory.ok:
+                break
         result.inventory = inventory
         if not inventory.ok:
             result.status = "GREŠKA EKSTRAKCIJE"
@@ -1464,6 +1514,9 @@ def process_product(product: Product, category: str, sources: list[Source],
         raw, interni_json = odvoji_json_blok(raw)
         md = clean_markdown(raw)
         md = R.ukloni_crtice(md)                    # Z4, sigurnosna mreža
+        md, ean_upisan = upisi_ean(md, inventory)   # potvrđen EAN ide u Tab 5
+        if ean_upisan:
+            result.info.append("EAN iz izvora automatski upisan u Tab 5")
         md = R.primijeni_rjecnik(md)                # ujednačen zapis brendova
         result.nedostaje = [str(x) for x in (interni_json.get("nedostaje") or [])]
         if interni_json.get("konflikti"):
