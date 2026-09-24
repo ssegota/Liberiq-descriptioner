@@ -208,7 +208,8 @@ md_ph = md_lost.replace("| EAN | 3337875863377 |",
 check("placeholder umjesto pronađene vrijednosti detektiran",
       len(X.placeholder_instead_of_value(inv, md_ph)) > 0)
 check("„Obvezna provjera prije objave“ nije lažna prijava",
-      X.placeholder_instead_of_value(inv, md_lost) == [])
+      not any("Obvezna provjera" in p for p in
+              X.placeholder_instead_of_value(inv, md_lost)))
 
 # 16. pipeline: ekstrakcija -> pisac -> coverage -> OK
 class PDPClient:
@@ -263,7 +264,7 @@ check("kanonski naziv izvučen iz PDP-a",
 
 # 21. brand source samo sa službene domene brenda
 srcs = [P.Source("S1", "stranica proizvoda", "https://eljekarna24.hr/x", "t", "a"),
-        P.Source("S2", P.SECONDARY_LABEL,
+        P.Source("S2", P.TERTIARY_LABEL,
                  "https://www.laroche-posay.com.hr/effaclar", "t", "b" * 300),
         P.Source("S3", "web", "https://neki-forum.hr/tema", "t", "c" * 300)]
 bs = A.brand_source_for(srcs, "La Roche-Posay")
@@ -290,20 +291,22 @@ print("\n=== Hijerarhija izvora i definitivni izrazi ===")
 
 # 23. hijerarhija: S1 link, S2 vasezdravlje, S3+ ostali
 srcs = [P.Source("S1", "stranica proizvoda", "https://eljekarna24.hr/x", "t", "a"),
-        P.Source("S2", P.SECONDARY_LABEL, "https://solgar.hr/proizvod", "t", "b"),
-        P.Source("S3", "web", "https://webljekarna.vasezdravlje.com/p", "t", "c")]
+        P.Source("S2", P.SECONDARY_LABEL,
+                 "https://webljekarna.vasezdravlje.com/p", "t", "b"),
+        P.Source("S3", P.TERTIARY_LABEL, "https://solgar.hr/proizvod", "t", "c")]
 blok = P.sources_block(srcs)
-check("prompt označava PRIORITET 1 i 2 (bez trećih izvora)",
-      "PRIORITET 1" in blok and "PRIORITET 2" in blok and "PRIORITET 3" not in blok)
-check("vasezdravlje je zabranjen izvor",
-      R.je_dopusten("https://webljekarna.vasezdravlje.com/p", "Solgar")[0] is False)
+check("prompt označava sva tri prioriteta",
+      all(f"PRIORITET {i}" in blok for i in (1, 2, 3)))
+check("vasezdravlje je izvor 2",
+      R.prioritet_izvora("https://webljekarna.vasezdravlje.com/p", "Solgar") == 2)
 
 # 24. SEO sekundarni izvor: vasezdravlje ima prednost pred brendom
 bs = A.brand_source_for(srcs, "Solgar")
-check("SEO izvor 2 je službena stranica brenda",
-      bs is not None and "solgar.hr" in bs.url, f"({bs.url if bs else None})")
-bs3 = A.brand_source_for([srcs[0], srcs[2]], "Solgar")
-check("SEO: druga ljekarna se ne koristi", bs3 is None)
+check("SEO izvor 2 je vasezdravlje",
+      bs is not None and "vasezdravlje" in bs.url, f"({bs.url if bs else None})")
+bs3 = A.brand_source_for([srcs[0], P.Source("S2", "web", "https://forum.hr/x", "t", "y")],
+                         "Solgar")
+check("SEO: nedopušten izvor se ne koristi", bs3 is None)
 
 # 25. definitivni izrazi
 for izraz in ("Najbolji izbor za kožu.", "Najučinkovitiji proizvod u ponudi.",

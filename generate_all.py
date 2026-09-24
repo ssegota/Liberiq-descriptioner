@@ -88,12 +88,13 @@ def canonical_name_from_md(md: str) -> str:
 def brand_source_for(sources, brend: str):
     """Izvor 2 za SEO: isključivo službena hrvatska stranica brenda.
     Sve ostalo (druge ljekarne, tražilice, strana tržišta) blokira allowlist."""
-    for s in sources:
-        if s.kind != P.SECONDARY_LABEL:
-            continue
-        dopusteno, _razlog = R.je_dopusten(s.url, brend)
-        if dopusteno:
-            return S.BrandSource(url=s.url, text=s.text[:2000])
+    # izvor 2 (vasezdravlje) ima prednost pred izvorom 3 (stranica brenda)
+    for oznaka in (P.SECONDARY_LABEL, P.TERTIARY_LABEL):
+        for s in sources:
+            if s.kind != oznaka:
+                continue
+            if R.prioritet_izvora(s.url, brend) in (2, 3):
+                return S.BrandSource(url=s.url, text=s.text[:2000])
     return None
 
 
@@ -199,7 +200,8 @@ def write_interni_file(records: list[dict], out_dir: Path):
             "Izvor – eljekarna24": r.get("SEO Izvor – eljekarna24", ""),
             "Izvor – brend": r.get("SEO Izvor – brend", ""),
             "Preuzeto s brend stranice": r.get("SEO Preuzeto s brend stranice", ""),
-            "Nedostaje": r.get("PDP Nedostaje", ""),
+            "Nedostaje": " | ".join(x for x in (r.get("PDP Nedostaje", ""),
+                                               r.get("SEO Nedostaje", "")) if x),
             "Konflikti": r.get("PDP Konflikt izvora", ""),
             "Napomena validatora": napomene,
             "PDP Status": r.get("PDP Status", ""),

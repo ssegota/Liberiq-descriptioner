@@ -369,6 +369,12 @@ POLJE_U_REDAK = {
     "pakiranje": "pakiranje",
 }
 
+# Polja za koja placeholder nije dopušten ako je vrijednost pronađena u izvoru.
+NE_SMIJE_PLACEHOLDER = {
+    "doza", "puni_sastav", "aktivne_tvari", "aktivni_sastojci", "upozorenja",
+    "studije", "nacin_uporabe", "dobna_faza", "specifikacije",
+}
+
 
 def placeholder_instead_of_value(inv: Inventory, md: str) -> list[str]:
     """Placeholder na mjestu gdje izvor ima konkretnu vrijednost.
@@ -378,6 +384,29 @@ def placeholder_instead_of_value(inv: Inventory, md: str) -> list[str]:
     okida na svakom proizvodu).
     """
     out = []
+
+    # a) polja bez vlastitog retka: placeholder bilo gdje, a vrijednost postoji
+    for fact in inv.found():
+        if fact.polje not in NE_SMIJE_PLACEHOLDER or not fact.vrijednost.strip():
+            continue
+        bits = [b for b in _key_bits(fact.vrijednost) if _norm(b)][:5]
+        # brojčani podatak (doza, količina, koncentracija) je odlučujući:
+        # ako ga u dokumentu nema, podatak nije upisan
+        brojcani = [b for b in bits if re.search(r"\d", b)]
+        if brojcani:
+            if all(_norm(b) in _norm(md) for b in brojcani):
+                continue
+        else:
+            pogodaka = sum(1 for b in bits if _norm(b) in _norm(md))
+            if bits and pogodaka / len(bits) >= 0.5:
+                continue
+        if any(h in md.lower() for h in PLACEHOLDER_HINTS):
+            out.append(
+                f"„{fact.polje}“ je pronađen u izvorima "
+                f"({fact.vrijednost[:50]}), a u dokumentu stoji placeholder. "
+                "Podatak pronađen u izvoru mora biti upisan.")
+
+    # b) polja s vlastitim retkom u Tab 5
     for fact in inv.found():
         redak_naziv = POLJE_U_REDAK.get(fact.polje)
         if not redak_naziv:

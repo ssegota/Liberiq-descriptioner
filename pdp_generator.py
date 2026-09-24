@@ -98,7 +98,8 @@ USER_AGENT = (
 #   prioritet 2 — zadani sekundarni izvor (webljekarna.vasezdravlje.com)
 #   prioritet 3 — svi ostali web izvori
 PRIMARY_DOMAIN = "eljekarna24"
-SECONDARY_LABEL = "službena stranica brenda"
+SECONDARY_LABEL = "webljekarna.vasezdravlje.com"
+TERTIARY_LABEL = "službena stranica brenda"
 
 CATEGORY_QUERY_EXTRA = {
     "cosmetics": "sastav INCI",
@@ -528,9 +529,14 @@ def gather_sources(product: Product, category: str, cache_dir: Path,
     if not sources:
         return sources
 
-    # --- izvor 2: samo službena hrvatska stranica brenda ---
+    # --- izvor 2: webljekarna.vasezdravlje.com, pa izvor 3: stranica brenda ---
     if secondary and web_search:
-        for url in brand_site_urls(product):
+        kandidati = []
+        sek = site_search_url(product, R.SEKUNDARNA_DOMENA)
+        if sek:
+            kandidati.append((sek, SECONDARY_LABEL))
+        kandidati += [(u, TERTIARY_LABEL) for u in brand_site_urls(product)]
+        for url, oznaka in kandidati:
             dopusteno, _razlog = R.je_dopusten(url, product.brend)
             if not dopusteno:
                 continue
@@ -540,9 +546,8 @@ def gather_sources(product: Product, category: str, cache_dir: Path,
             title, text = extract_generic_page(brand_html)
             if len(text) < 150:
                 continue
-            sources.append(Source(sid=f"S{len(sources) + 1}", kind=SECONDARY_LABEL,
-                                  url=url, title=title or "stranica brenda",
-                                  text=text))
+            sources.append(Source(sid=f"S{len(sources) + 1}", kind=oznaka,
+                                  url=url, title=title or oznaka, text=text))
             time.sleep(0.3)
 
     for i, src in enumerate(sources, start=1):
@@ -560,9 +565,11 @@ def sources_block(sources: list[Source]) -> str:
         if s.kind == "stranica proizvoda":
             head = (f"[{s.sid}] PRIORITET 1 — STRANICA PROIZVODA (eljekarna24) "
                     f"— {s.url}")
-        else:
-            head = (f"[{s.sid}] PRIORITET 2 — SLUŽBENA STRANICA BRENDA "
+        elif s.kind == SECONDARY_LABEL:
+            head = (f"[{s.sid}] PRIORITET 2 — webljekarna.vasezdravlje.com "
                     f"— {s.url}")
+        else:
+            head = f"[{s.sid}] PRIORITET 3 — SLUŽBENA STRANICA BRENDA — {s.url}"
         parts.append(f"{head}\n{s.text}")
     return "\n\n".join(parts)
 
@@ -721,6 +728,15 @@ najbolji način prehrane dojenčeta.") i mjerni izrazi ("najviše", "najmanje",
 "najkasnije").
 
 PRAVILA IZLAZA (spremno za copy/paste)
+- Iz naziva proizvoda IZBACI promotivne oznake: „2+1 GRATIS“, „akcija“,
+  „poklon“, „popust“, „specijalna ponuda“. Količina je stvarni sadržaj
+  pakiranja. Multipakiranje piši u formatu „3 × 18 tableta“.
+- AKO JE PODATAK PRONAĐEN U IZVORU, MORA BITI UPISAN, i to u svakom tabu u
+  koji spada: dnevna doza, istaknuti sastojci, puni sastav, upozorenja,
+  kliničke studije, EAN, proizvođač, pakiranje. Placeholder iz predloška
+  („Unijeti točno prema aktualnoj deklaraciji ili PIM-u.“) smije se upisati
+  SAMO kada podatak stvarno ne postoji ni u jednom izvoru. Nikada ne upućuj
+  na deklaraciju ili PIM za podatak koji imaš u inventaru.
 - U tekst za kupca NE piši oznake izvora ([S1], [S2]), riječi „KONFLIKT“,
   „potvrditi“, „provjeriti koji je ispravan“, „Prije lokalne objave“, „prema
   dostupnoj dokumentaciji“, nazive drugih trgovina ni njihove šifre.
@@ -790,8 +806,9 @@ MODEL NE SMIJE
 
 HIJERARHIJA IZVORA (provodi se u kodu)
 - PRIORITET 1: stranica proizvoda na eljekarna24 (URL iz ulazne tablice).
-- PRIORITET 2: službena hrvatska stranica brenda, samo za podatak kojeg nema
-  na prioritetu 1.
+- PRIORITET 2: webljekarna.vasezdravlje.com, za podatak kojeg nema na
+  prioritetu 1.
+- PRIORITET 3: službena hrvatska stranica brenda, za podatak kojeg nema na 1 ni 2.
 - Drugih izvora nema. Ako podatka nema ni u jednom od ta dva izvora, NE
   izmišljaj ga: ostavi tekst iz predloška i navedi polje u listi "nedostaje".
 - Ako se konkretne vrijednosti razlikuju, NE spajaj ih i NE biraj sam:
@@ -1514,6 +1531,7 @@ def process_product(product: Product, category: str, sources: list[Source],
         raw, interni_json = odvoji_json_blok(raw)
         md = clean_markdown(raw)
         md = R.ukloni_crtice(md)                    # Z4, sigurnosna mreža
+        md = R.normaliziraj_multipak(md)            # „3 × 18 tableta“
         md, ean_upisan = upisi_ean(md, inventory)   # potvrđen EAN ide u Tab 5
         if ean_upisan:
             result.info.append("EAN iz izvora automatski upisan u Tab 5")
@@ -1577,7 +1595,8 @@ def process_product(product: Product, category: str, sources: list[Source],
                     # neslaganje je zabilježeno u stupcu Konflikti; tekst je ispravan
                     informativno.append("neslaganje izvora zabilježeno interno")
                 result.info.extend(informativno)
-                if razlozi:
+                # t.8: OK samo ako validator nema nijednu napomenu
+                if razlozi or result.notes:
                     result.status = "TREBA PROVJERA"
                     result.notes.extend(razlozi)
                 else:

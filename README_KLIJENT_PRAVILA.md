@@ -88,3 +88,43 @@ brenda je jedan redak. Rječnik zapisa brendova i linija je `RJECNIK_ZAPISA`.
 Zarez ispred količine u PDP nazivu, zapis naziva linija (RC 01, UreaRepair,
 UVMUNE), tvrdnje za prijelaznu formulu i mlijeko za malu djecu, izvor EAN-a i
 proizvođača (PIM ili stranica eljekarna24).
+
+## Verzija 3 (klijentove izmjene nakon druge vrtnje)
+
+### Izvori
+Hijerarhija je vraćena na: **1. eljekarna24.hr**, **2.
+webljekarna.vasezdravlje.com**, **3. službena hrvatska stranica brenda.**
+Ostale ljekarne, tražilice, marketplace i strana tržišta i dalje su blokirani
+allowlistom (`pravila.py`, `prioritet_izvora()`).
+
+### PDP
+- Promotivne oznake se brišu iz naziva („2+1 GRATIS“, „akcija“, „poklon“,
+  „popust“). Količina je stvarni sadržaj pakiranja, multipakiranje u formatu
+  **3 × 18 tableta** (`ukloni_promo()`, `normaliziraj_multipak()`).
+- Podatak pronađen u izvoru **mora biti upisan** u svaki tab u koji spada:
+  dnevna doza, istaknuti sastojci, puni sastav, upozorenja, kliničke studije,
+  EAN, proizvođač, pakiranje. Placeholder je dopušten samo kada podatka nema.
+  Brojčani podatak je odlučujući: ako doza ili koncentracija iz izvora nije u
+  dokumentu, redak pada.
+
+### Title i meta opis
+1. **Obrnuti redoslijed skraćivanja**: prvo se izostavi ` | eljekarna24`, tek
+   onda se krati naziv, i to uklanjanjem namjene pa općih pridjeva. Brend,
+   linija, tip, varijanta i količina se nikad ne uklanjaju.
+2. **Tip proizvoda je zaštićen** (krema, serum, sprej, balzam, tlakomjer,
+   inhalator, vaga, formula, šampon, sirup, tablete, kapsule i dr.). Title ne
+   smije završiti pridjevom.
+3. **Varijanta razlikuje proizvode**: ako dva SKU-a daju isti title, kod dodaje
+   varijantu (SPF, jakost, nijansa, RC oznaka, multipak) i ponovno mjeri.
+   Duplikat se ne isporučuje.
+4. Podatak samo iz izvora; sastojak, EAN, tehnički podatak i brojka navode se
+   samo ako su imenovani u izvoru.
+5. **Specifikacija mora biti doslovna**: ako nije doslovno u izvoru, redak je
+   greška (prije je bila informacija).
+6. Količina iz naziva je mjerodavna i ista u PDP nazivu, titlu i meta opisu.
+   Uspoređuje se **količina pakiranja**, ne svaki broj (jačina 100 mcg nije
+   količina).
+7. Brend i linija pišu se prema rječniku, bez prevođenja i mijenjanja
+   redoslijeda (`primijeni_rjecnik()`).
+8. **Status OK samo uz nula napomena validatora.**
+9. Stupac **Nedostaje** popunjava se popisom polja kojih nema u izvorima.

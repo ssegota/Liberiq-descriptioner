@@ -382,6 +382,7 @@ class RowResult:
     info: list = field(default_factory=list)      # informativno, ne utječe na status
     specs_used: list = field(default_factory=list)
     namjena: str = ""
+    nedostaje: list = field(default_factory=list)
     brand_url: str = ""
     brand_data: list = field(default_factory=list)
     page: PageData = field(default_factory=PageData)
@@ -406,6 +407,7 @@ class RowResult:
             "Informativno": " | ".join(self.info),
             "Korištene specifikacije": "; ".join(map(str, self.specs_used)),
             "Namjena": self.namjena,
+            "Nedostaje": " | ".join(self.nedostaje),
             "Izvor – eljekarna24": self.product.url if self.page.fetched else "",
             "Izvor – brend": self.brand_url if self.brand_data else "",
             "Preuzeto s brend stranice": ", ".join(self.brand_data),
@@ -927,11 +929,24 @@ def validate_candidate(cand: Candidate, product: Product, page: PageData,
         if m_nospace:
             errors.append(f"'{m_nospace.group(0)}' — između broja i jedinice mora "
                           "biti razmak (npr. '75 ml').")
+        kol_naziv = R.kolicina_pakiranja(canonical_name or product.naziv)
+        if kol_naziv and norm_compact(kol_naziv) not in norm_compact(title):
+            errors.append(
+                f"Title mora sadržavati količinu iz naziva („{kol_naziv}“). "
+                "Količina se nikad ne uklanja.")
         src_qty = quantity_tokens(canonical_name or product.naziv)
-        if src_qty and not (quantity_tokens(title) & src_qty):
+        if False and src_qty and not (quantity_tokens(title) & src_qty):
             errors.append(
                 f"Title je izgubio količinu ({sorted(src_qty)[0]}). Količina se "
                 "NIKAD ne uklanja — skrati uklanjanjem sporednih značajki.")
+        tip_naziv = R.sadrzi_tip(canonical_name or product.naziv)
+        if tip_naziv and not R.sadrzi_tip(title):
+            errors.append(
+                f"Title je izgubio tip proizvoda („{tip_naziv}“). Tip je "
+                "zaštićen i nikad se ne uklanja.")
+        if R.zavrsava_pridjevom(title):
+            errors.append("Title ne smije završiti pridjevom. Ukloni pridjev ili "
+                          "zadrži tip proizvoda i količinu na kraju.")
         if R.zavrsava_lose(title):
             errors.append("Title završava prijedlogom, veznikom, znakom ili brojem "
                           "bez jedinice. Ukloni cijeli segment, ne dio fraze.")
@@ -1019,7 +1034,8 @@ def validate_candidate(cand: Candidate, product: Product, page: PageData,
                 errors.append(f"Meta opis sadrži zabranjenu formulaciju količine "
                               f"„{fraza}“. Količina se piše samo jednom, u prvoj "
                               "rečenici.")
-        if len(KOLICINA_U_META_RE.findall(meta)) > 1:
+        if len(set(m.group(0).lower() for m in
+                   R.KOLICINA_PAK_RE.finditer(meta))) > 1:
             errors.append("Količina se u meta opisu spominje više puta. Napiši je "
                           "samo jednom, u prvoj rečenici.")
         if R.nadi_crtice(meta):
@@ -1034,8 +1050,8 @@ def validate_candidate(cand: Candidate, product: Product, page: PageData,
             if brend_rijec and norm_compact(brend_rijec) not in norm_compact(meta):
                 errors.append(f"Meta opis ne sadrži brend „{brend_rijec}“ iz titla.")
         if title:
-            kol_title = R.kolicina_iz(title)
-            kol_meta = R.kolicina_iz(meta)
+            kol_title = R.kolicina_pakiranja(title)
+            kol_meta = R.kolicina_pakiranja(meta)
             if kol_title and kol_meta and norm_compact(kol_title) != norm_compact(kol_meta):
                 errors.append(f"Količina se razlikuje: title „{kol_title}“, meta "
                               f"„{kol_meta}“. Mora biti ista u PDP nazivu, titlu i "
@@ -1070,10 +1086,11 @@ def validate_candidate(cand: Candidate, product: Product, page: PageData,
         if not rijeci:
             continue
         pogodaka = sum(1 for w in rijeci if w in source_spaced)
-        if pogodaka / len(rijeci) < 0.5:
-            # revizijski trag, ne tekst za kupca: bilježi se, ali ne blokira
-            napomene_info.append(
-                f"specifikacija '{str(spec)[:60]}' nije doslovno pronađena u izvoru")
+        if pogodaka / len(rijeci) < 0.8:
+            errors.append(
+                f"Specifikacija „{str(spec)[:60]}“ nije doslovno pronađena u "
+                "izvoru. Koristi isključivo doslovne formulacije iz izvora ili "
+                "izostavi specifikaciju.")
 
     # jedinstvenost
     if title and norm_compact(title) in seen_titles:
@@ -1159,6 +1176,31 @@ def trim_meta_to_px(meta: str, limit_px: float) -> str:
     return out
 
 
+VARIJANTNI_UZORCI = [
+    re.compile(r"\bSPF\s*\d+\+?\b", re.IGNORECASE),
+    re.compile(r"\b\d+(?:[.,]\d+)?\s*%", re.IGNORECASE),
+    re.compile(r"\b\d+(?:[.,]\d+)?\s*(?:mg|mcg|µg|IU|ml|g)\b", re.IGNORECASE),
+    re.compile(r"\b(Riche|Légère|Legere|Light|Forte|Plus|Intense|Extra|"
+               r"Sensitive|Dry|Normal|Kids|Junior|Men|Woman)\b", re.IGNORECASE),
+    re.compile(r"\bRC\s*\d{1,2}\b", re.IGNORECASE),
+    re.compile(r"\b\d+\s*×\s*\d+\b"),
+]
+
+
+def dodaj_varijantu(title: str, izvor_naziv: str) -> str:
+    """Kad dva SKU-a daju isti title, dodaj razlikovnu varijantu iz naziva."""
+    for uzorak in VARIJANTNI_UZORCI:
+        for m in uzorak.finditer(izvor_naziv or ""):
+            oznaka = m.group(0).strip()
+            if norm_compact(oznaka) and norm_compact(oznaka) not in norm_compact(title):
+                kol = R.kolicina_pakiranja(title)
+                if kol and title.rstrip().endswith(kol):
+                    glava = title[: title.rfind(kol)].rstrip()
+                    return f"{glava} {oznaka} {kol}".strip()
+                return f"{title} {oznaka}".strip()
+    return title
+
+
 def finalize_title(core: str) -> tuple[str, float, str]:
     """Dodaje ' | eljekarna24' samo ako ukupno stane u 550 px (pravilo klijenta)."""
     full = core + BRAND_SUFFIX
@@ -1242,9 +1284,15 @@ def process_product(product: Product, page: PageData, client: BedrockClient,
         return result
 
     title_core, meta = best.title_core, best.meta
+    title_core = R.primijeni_rjecnik(title_core)      # t.7 zapis iz rječnika
+    meta = R.primijeni_rjecnik(meta)
     result.specs_used = best.specs_used
     result.namjena = best.namjena
     result.brand_data = best.brand_data
+    if not best.namjena_potvrdjena or not best.namjena:
+        result.nedostaje.append("namjena")
+    if not best.specs_used:
+        result.nedostaje.append("specifikacije")
     remaining = list(best_errors)
 
     # fallback: determinističko skraćivanje ako je jedini problem duljina
@@ -1269,26 +1317,6 @@ def process_product(product: Product, page: PageData, client: BedrockClient,
         else:
             remaining = recheck
 
-    # pokušaj uklopiti nastavak webshopa uklanjanjem SPOREDNOG segmenta;
-    # ako to nije moguće bez gubitka obveznih dijelova, title ostaje bez nastavka
-    if TITLE_CORE_TARGET_PX < text_width_px(title_core, TITLE_FONT_PX) <= TITLE_MAX_PX:
-        kandidat = R.skrati_po_segmentima(
-            title_core,
-            stane=lambda t: text_width_px(t, TITLE_FONT_PX) <= TITLE_CORE_TARGET_PX,
-            obavezno=obavezni_pojmovi(canonical_name or product.naziv))
-        if (kandidat and text_width_px(kandidat, TITLE_FONT_PX) <= TITLE_CORE_TARGET_PX
-                and not R.zavrsava_lose(kandidat)
-                and R.kolicina_iz(kandidat) == R.kolicina_iz(title_core)):
-            with lock:
-                provjera = validate_candidate(
-                    Candidate(title_core=kandidat, meta=meta,
-                              specs_used=best.specs_used, namjena=best.namjena),
-                    product, page, seen_titles, seen_metas, canonical_name,
-                    napomene_info=[])
-            if not provjera:
-                title_core = kandidat
-                result.info.append("title skraćen da stane nastavak webshopa")
-
     # sigurnosna mreža: title nikad ne smije prijeći 550 px, bez obzira na
     # to je li preostalo još kakvih napomena
     if text_width_px(title_core, TITLE_FONT_PX) > TITLE_MAX_PX:
@@ -1306,10 +1334,30 @@ def process_product(product: Product, page: PageData, client: BedrockClient,
     if result.brand_data:
         poruka = ("podatak s brend stranice: " + ", ".join(result.brand_data))
         (result.notes if STROGI_NACIN else result.info).append(poruka)
+    # t.3 duplikat se ne isporučuje: dodaj varijantu i ponovno izmjeri
+    if not remaining:
+        with lock:
+            duplikat = norm_compact(title_core) in seen_titles
+        if duplikat:
+            kandidat = dodaj_varijantu(title_core, canonical_name or product.naziv)
+            if (norm_compact(kandidat) != norm_compact(title_core)
+                    and text_width_px(kandidat, TITLE_FONT_PX) <= TITLE_MAX_PX):
+                title_core = kandidat
+                result.info.append("dodana varijanta radi razlikovanja od "
+                                   "istovjetnog titla")
+            with lock:
+                if norm_compact(title_core) in seen_titles:
+                    remaining = ["Title nije jedinstven ni nakon dodavanja "
+                                 "varijante. Dodaj razlikovni podatak iz naziva."]
+
     if not remaining:
         # status OK samo kad validator nema nijednu napomenu (upute, točka 6)
+        # t.8: OK samo uz nula napomena validatora
+        preostale = [n for n in result.notes
+                     if n != "automatski skraćeno na limit"]
         result.status = ("TREBA PROVJERA"
-                         if (STROGI_NACIN and result.brand_data) else "OK")
+                         if preostale or (STROGI_NACIN and result.brand_data)
+                         else "OK")
         with lock:
             seen_titles.add(norm_compact(title_core))
             seen_metas.add(norm_compact(meta))

@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 # ---------------------------------------------------------------------------
 
 PRIMARNA_DOMENA = "eljekarna24.hr"
+SEKUNDARNA_DOMENA = "webljekarna.vasezdravlje.com"
 
 # Službene hrvatske stranice brendova. Popis održava tim, ne model.
 # Ključ je normalizirani naziv brenda iz ulazne tablice.
@@ -48,7 +49,7 @@ BREND_DOMENE: dict[str, tuple[str, ...]] = {
 # Domene koje su izričito zabranjene (druge ljekarne, tražilice, marketplace).
 # Popis je dokumentacijski; blokira ih ionako allowlist.
 ZABRANJENE_DOMENE = (
-    "webljekarna.vasezdravlje.com", "vasezdravlje.com", "ljekarne.hr",
+    "ljekarne.hr",
     "ljekarne-plantak.hr", "onlineljekarna.hr", "pharmacy.hr", "ljekarnaonline.hr",
     "bing.com", "google.com", "amazon.com", "amazon.de", "ebay.com", "emag.hr",
 )
@@ -72,8 +73,26 @@ def _norm_brend(brend: str) -> str:
 
 
 def dopustene_domene(brend: str) -> tuple[str, ...]:
-    """Domene dopuštene za ovaj brend: eljekarna24 + hrvatska stranica brenda."""
-    return (PRIMARNA_DOMENA,) + BREND_DOMENE.get(_norm_brend(brend), ())
+    """Hijerarhija izvora (klijent, verzija 3):
+       1. eljekarna24.hr
+       2. webljekarna.vasezdravlje.com
+       3. službena hrvatska stranica brenda
+    Sve ostalo se odbacuje."""
+    return ((PRIMARNA_DOMENA, SEKUNDARNA_DOMENA)
+            + BREND_DOMENE.get(_norm_brend(brend), ()))
+
+
+def prioritet_izvora(url: str, brend: str = "") -> int:
+    """1, 2 ili 3 prema hijerarhiji; 0 ako izvor nije dopušten."""
+    host = _host(url)
+    if host.endswith(PRIMARNA_DOMENA):
+        return 1
+    if host.endswith(SEKUNDARNA_DOMENA):
+        return 2
+    for d in BREND_DOMENE.get(_norm_brend(brend), ()):
+        if host == d or host.endswith("." + d):
+            return 3
+    return 0
 
 
 def je_primarni(url: str) -> bool:
@@ -131,6 +150,44 @@ def primijeni_rjecnik(tekst: str) -> str:
     # Sagas linije: RC-01 / RC01 -> RC 01
     out = re.sub(r"\bRC[-\s]?(\d{1,2})\b", r"RC \1", out, flags=re.IGNORECASE)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Promo oznake i multipakiranje
+# ---------------------------------------------------------------------------
+
+PROMO_UZORCI = [
+    re.compile(r"\b\d+\s*\+\s*\d+\s*(gratis|besplatno)\b", re.IGNORECASE),
+    re.compile(r"\bgratis\b", re.IGNORECASE),
+    re.compile(r"\bakcij\w*", re.IGNORECASE),
+    re.compile(r"\bpoklon\w*", re.IGNORECASE),
+    re.compile(r"\bpopust\w*", re.IGNORECASE),
+    re.compile(r"\bpromo\b", re.IGNORECASE),
+    re.compile(r"\bspecijalna ponuda\b", re.IGNORECASE),
+    re.compile(r"\b\d+\s*za\s*\d+\b", re.IGNORECASE),
+]
+
+# "3x18 tableta", "3 x 18 tableta", "a18" -> normalizirani zapis
+MULTIPAK_RE = re.compile(
+    rf"\b(\d+)\s*[x×]\s*(\d+)\s*({JEDINICE})\b" if False else
+    r"\b(\d+)\s*[x×]\s*(\d+)\s*([A-Za-zČĆŽŠĐčćžšđ]+)\b")
+
+
+def ukloni_promo(naziv: str) -> str:
+    """Iz naziva makni promotivne oznake; količina ostaje stvarni sadržaj."""
+    out = naziv or ""
+    for uzorak in PROMO_UZORCI:
+        out = uzorak.sub(" ", out)
+    out = re.sub(r"\s*[-,]\s*(?=$|[,.])", "", out)
+    out = re.sub(r"\s{2,}", " ", out)
+    return out.strip(" ,-")
+
+
+def normaliziraj_multipak(tekst: str) -> str:
+    """Multipakiranje u dogovorenom formatu: „3 × 18 tableta“."""
+    def zamjena(m):
+        return f"{m.group(1)} × {m.group(2)} {m.group(3)}"
+    return MULTIPAK_RE.sub(zamjena, tekst or "")
 
 
 # ---------------------------------------------------------------------------
@@ -322,8 +379,69 @@ JEDINICE = (r"ml|l|g|kg|mg|mcg|µg|IU|cm|mm|%|tableta|tablete|tableti|kapsula|"
             r"šumećih tableta|vrećica")
 KOLICINA_RE = re.compile(rf"\b\d+(?:[.,]\d+)?\s*(?:{JEDINICE})\b", re.IGNORECASE)
 
-OPCI_PRIDJEVI = ("intenzivn", "nježn", "blag", "napredn", "poseb", "svakodnevn",
-                 "učinkovit", "bogat", "lagan", "svjež", "prirodn")
+OPCI_PRIDJEVI = ("intenzivn", "nježn", "njezn", "blag", "napredn", "poseb",
+                 "svakodnevn", "učinkovit", "ucinkovit", "bogat", "lagan",
+                 "svjež", "svjez", "prirodn", "hranjiv", "umirujuć", "umirujuc",
+                 "osvježavajuć", "obnavljajuć", "zaštitn", "zastitn", "njegujuć")
+
+# Tip proizvoda je zaštićen i nikad se ne uklanja (klijent, verzija 3, t. 2).
+ZASTICENI_TIPOVI = (
+    "krema", "kreme", "serum", "seruma", "sprej", "spreja", "balzam", "balzama",
+    "gel", "gela", "losion", "losiona", "mlijeko", "mlijeka", "fluid", "fluida",
+    "maska", "maske", "ulje", "ulja", "pjena", "pjene", "šampon", "sampon",
+    "regenerator", "sirup", "sirupa", "tablete", "tableta", "tabletе",
+    "kapsule", "kapsula", "vrećice", "vrecice", "prašak", "prah", "kapi",
+    "tlakomjer", "inhalator", "vaga", "toplomjer", "formula", "formule",
+    "napitak", "bombone", "štapić", "stapic", "štapiću", "stapicu",
+    "dezodorans", "puder", "ruž", "maskara", "pasta", "otopina", "sol",
+    "njega", "njegu", "njege", "kupka", "sapun", "gel-krema", "emulzija",
+    "koncentrat", "tonik", "piling", "melem", "mast", "sprej", "roll-on",
+    "tinktura", "čaj", "caj", "granule", "pastile", "lizalice", "flaster",
+)
+
+# Nastavci pridjeva: title ne smije završiti pridjevom (t. 2).
+PRIDJEVSKI_NASTAVCI = ("ni", "na", "no", "ne", "nu", "ki", "ka", "ko", "ski",
+                       "ški", "čki", "an", "na", "ivi", "ova", "ovo", "ovi",
+                       "asti", "ast", "ljiv", "ljiva", "ljivo")
+
+
+def sadrzi_tip(tekst: str) -> str:
+    """Vrati zaštićeni tip proizvoda pronađen u tekstu, ako postoji."""
+    nisko = f" {(tekst or '').lower()} "
+    for tip in ZASTICENI_TIPOVI:
+        if f" {tip} " in nisko:
+            return tip
+    return ""
+
+
+def zavrsava_pridjevom(title: str) -> bool:
+    """Zadnja riječ je opći pridjev (npr. „…hidratantna“)."""
+    if not title:
+        return False
+    zadnja = re.sub(r"[^\wČĆŽŠĐčćžšđ]+$", "", title.split()[-1]).lower()
+    if not zadnja or zadnja in ZASTICENI_TIPOVI:
+        return False
+    zadnja_bez = _norm(zadnja)
+    if any(zadnja_bez.startswith(_norm(p)) for p in OPCI_PRIDJEVI):
+        return True
+    if len(zadnja) >= 6 and zadnja.endswith(PRIDJEVSKI_NASTAVCI):
+        # brojevi, jedinice i imena nisu pridjevi
+        if not re.search(r"\d", zadnja) and zadnja not in ZASTICENI_TIPOVI:
+            return True
+    return False
+
+
+PAK_JEDINICE = (r"ml|l|kg|g|tableta|tablete|tableti|kapsula|kapsule|kapsuli|"
+                r"vrećica|vrećice|vrecica|vrecice|komad|komada|bombona|"
+                r"šumećih tableta|sumecih tableta|kom")
+KOLICINA_PAK_RE = re.compile(
+    rf"\b(\d+(?:[.,]\d+)?)\s*(?:{PAK_JEDINICE})\b", re.IGNORECASE)
+
+
+def kolicina_pakiranja(tekst: str) -> str:
+    """Količina PAKIRANJA (mg, mcg, µg, IU su jačina i ne broje se)."""
+    nalazi = list(KOLICINA_PAK_RE.finditer(tekst or ""))
+    return nalazi[-1].group(0).strip() if nalazi else ""
 
 
 def kolicina_iz(tekst: str) -> str:
@@ -367,6 +485,8 @@ def skrati_po_segmentima(naziv: str, stane, obavezno: list[str] | None = None) -
 
     def nuzan(seg: str) -> bool:
         if KOLICINA_RE.search(seg):
+            return True
+        if sadrzi_tip(seg):                     # tip proizvoda je zaštićen
             return True
         return any(_norm(o) and _norm(o) in _norm(seg) for o in obavezno)
 
@@ -417,8 +537,17 @@ def skrati_po_segmentima(naziv: str, stane, obavezno: list[str] | None = None) -
         if not granice:
             break
         rijeci = rijeci[:granice[-1]]
-    # tek ako ni to nije dovoljno, miču se pojedinačne riječi s kraja
+    # tek ako ni to nije dovoljno, miču se pojedinačne riječi s kraja;
+    # zaštićeni tip proizvoda se preskače (t. 2)
     while len(rijeci) > 2 and not stane(" ".join(rijeci + rep)):
+        zadnja_r = rijeci[-1].lower().strip(",.")
+        stiti_se = (zadnja_r in ZASTICENI_TIPOVI
+                    or any(_norm(zadnja_r) and _norm(zadnja_r) in _norm(o)
+                           for o in obavezno))
+        if stiti_se:
+            rep = [rijeci[-1]] + rep       # varijanta i tip idu u zaštićeni rep
+            rijeci = rijeci[:-1]
+            continue
         rijeci = rijeci[:-1]
     # glava ne smije završiti prijedlogom ili veznikom („…šampon protiv 200 ml“)
     while len(rijeci) > 1 and zavrsava_lose(" ".join(rijeci)):
@@ -426,4 +555,23 @@ def skrati_po_segmentima(naziv: str, stane, obavezno: list[str] | None = None) -
     rezultat = " ".join(rijeci + rep).strip(" ,")
     while rezultat and zavrsava_lose(rezultat):
         rezultat = " ".join(rezultat.split()[:-1]).strip(" ,")
+    # title ne smije završiti pridjevom (t. 2), ni neposredno ispred količine
+    def _bez_pridjeva_na_kraju(tekst: str) -> str:
+        rijeci_t = tekst.split()
+        kol = kolicina_pakiranja(tekst) or kolicina_iz(tekst)
+        rep_t: list[str] = []
+        if kol:
+            dijelovi = kol.lower().split()
+            nisko_t = [w.lower() for w in rijeci_t]
+            for i in range(len(rijeci_t) - len(dijelovi), -1, -1):
+                if nisko_t[i:i + len(dijelovi)] == dijelovi:
+                    rep_t, rijeci_t = rijeci_t[i:], rijeci_t[:i]
+                    break
+        while len(rijeci_t) > 2 and zavrsava_pridjevom(" ".join(rijeci_t)):
+            rijeci_t = rijeci_t[:-1]
+        while len(rijeci_t) > 1 and zavrsava_lose(" ".join(rijeci_t)):
+            rijeci_t = rijeci_t[:-1]
+        return " ".join(rijeci_t + rep_t).strip(" ,")
+
+    rezultat = _bez_pridjeva_na_kraju(rezultat)
     return rezultat or spoji(segmenti[:1])

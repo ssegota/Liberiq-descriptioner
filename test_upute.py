@@ -26,7 +26,7 @@ print("=== Z1. Hijerarhija izvora (allowlist u kodu) ===")
 primjeri = [
     ("https://eljekarna24.hr/proizvod", "Avène", True, "izvor 1"),
     ("https://www.eau-thermale-avene.com.hr/p", "Avène", True, "izvor 2"),
-    ("https://webljekarna.vasezdravlje.com/p", "Avène", False, "druga ljekarna"),
+    ("https://webljekarna.vasezdravlje.com/p", "Avène", True, "izvor 2"),
     ("https://ljekarne.hr/p", "Solgar", False, "druga ljekarna"),
     ("https://ljekarne-plantak.hr/p", "Solgar", False, "druga ljekarna"),
     ("https://onlineljekarna.hr/p", "Solgar", False, "druga ljekarna"),
@@ -50,14 +50,15 @@ prljavo = """### Tab 5
 | EAN | 123 [S2] |
 | --- | --- |
 
-KONFLIKT SKU-a: eljekarna24 navodi C001146, webljekarna.vasezdravlje.com navodi C002360.
+KONFLIKT SKU-a: eljekarna24 navodi C001146, ljekarne-plantak.hr navodi C002360.
 Potvrditi prema pakiranju.
 Prije lokalne objave provjeriti koji je ispravan, prema dostupnoj dokumentaciji."""
 nalazi = R.nadi_interne_napomene(prljavo)
 for trazeno in ("[S2]", "KONFLIKT", "potvrdit"):
     check(f"hvata „{trazeno}“", any(trazeno.lower() in n.lower() for n in nalazi))
-check("hvata spominjanje druge ljekarne",
-      any("trgovine" in n for n in nalazi), f"({len(nalazi)} nalaza)")
+check("hvata spominjanje zabranjene trgovine",
+      any("trgovine" in n for n in
+          R.nadi_interne_napomene("Dostupno i na ljekarne-plantak.hr")))
 check("brend „Master of Pharmacy“ nije lažna prijava",
       R.nadi_interne_napomene("Master of Pharmacy Broncho Release sirup 150 ml") == [])
 
@@ -67,9 +68,15 @@ cisto = ("| EAN | Unijeti točno prema aktualnoj deklaraciji ili PIM-u. |\n"
 check("tekst iz klijentovog predloška smije ostati",
       R.nadi_interne_napomene(cisto) == [], str(R.nadi_interne_napomene(cisto)))
 
-print("\n=== Z3. Bez uspoređivanja šifri drugih trgovina ===")
-check("SKU druge trgovine nije izvor",
-      R.je_dopusten("https://webljekarna.vasezdravlje.com/p", "NAN")[0] is False)
+print("\n=== Hijerarhija izvora, verzija 3 ===")
+check("prioritet 1 je eljekarna24",
+      R.prioritet_izvora("https://eljekarna24.hr/p", "NAN") == 1)
+check("prioritet 2 je webljekarna.vasezdravlje.com",
+      R.prioritet_izvora("https://webljekarna.vasezdravlje.com/p", "NAN") == 2)
+check("prioritet 3 je službena stranica brenda",
+      R.prioritet_izvora("https://nan.hr/p", "NAN") == 3)
+check("ostale ljekarne i dalje zabranjene",
+      R.prioritet_izvora("https://ljekarne.hr/p", "NAN") == 0)
 
 print("\n=== Z4. Bez crtica ===")
 check("crtica u tekstu se uklanja",
@@ -155,8 +162,8 @@ losi = [
      "Pakiranje od"),
     ("količina dvaput u meti",
      S.Candidate(title_core=CANON,
-                 meta=("Solgar Vitamin K1 za odrasle, 100 tableta. Dostupno u "
-                       "100 tableta.")), "više puta"),
+                 meta=("Solgar Vitamin K1 za odrasle, 100 tableta. Pakiranje "
+                       "sadrži 100 tableta i 50 tableta.")), "više puta"),
     ("zabranjena riječ",
      S.Candidate(title_core=CANON,
                  meta="Solgar Vitamin K1 za odrasle, 100 tableta. Optimalan unos."),
@@ -312,6 +319,76 @@ check("popis sastojaka se uspoređuje po stavkama",
 
 # blagi način: nedostatak EAN-a ne obara status
 check("blagi način je zadani", P.STROGI_NACIN is False and S.STROGI_NACIN is False)
+
+
+print("\n=== Verzija 3: klijentove izmjene ===")
+
+# PDP t.1 promo oznake i multipakiranje
+check("promo oznaka „2+1 GRATIS“ uklonjena",
+      "GRATIS" not in R.ukloni_promo("MAGNEZIJ B6 ŠUMEĆE TABLETE A18 2+1 GRATIS"))
+check("„akcija“ i „poklon“ uklonjeni",
+      R.ukloni_promo("Krema akcija poklon 50 ml").strip() == "Krema 50 ml")
+check("multipakiranje u formatu 3 × 18",
+      "3 × 18 tableta" in R.normaliziraj_multipak("pakiranje 3x18 tableta"))
+
+# SEO t.1 obrnuti redoslijed: nastavak se briše prije kraćenja naziva
+dugi = "Avène Sun Krema SPF50 za osjetljivu kožu lica 50 ml"
+puni, px, nap = S.finalize_title(dugi)
+check("nastavak se izostavlja umjesto kraćenja naziva",
+      puni == dugi and px <= 550 and nap, f"({px:.0f} px)")
+
+# SEO t.2 tip proizvoda zaštićen, bez pridjeva na kraju
+k = R.skrati_po_segmentima(
+    "Vichy Liftactiv Collagen Specialist dnevna hidratantna krema 50 ml",
+    stane=lambda x: S.text_width_px(x, 20) <= 430,
+    obavezno=S.obavezni_pojmovi("Vichy Liftactiv Collagen Specialist krema 50 ml"))
+check("tip proizvoda sačuvan pri kraćenju", R.sadrzi_tip(k) != "", f"({k})")
+check("title ne završava pridjevom", not R.zavrsava_pridjevom(k), f"({k})")
+
+# SEO t.3 duplikat dobiva varijantu
+check("duplikat se razlikuje varijantom",
+      "SPF30" in S.dodaj_varijantu("Avène Sun Krema 50 ml",
+                                   "AVENE SUN KREMA SPF30 50 ML"))
+
+# SEO t.5 nedoslovna specifikacija je greška
+prod_s = S.Product("Kozmetika", "Avène", "C1", "AVENE SUN KREMA SPF50 50 ML",
+                   "https://eljekarna24.hr/x/")
+page_s = S.PageData(fetched=True, content="Avene Sun krema SPF50 50 ml, vrlo "
+                                          "visoka zaštita od UVA i UVB zraka")
+kand = S.Candidate(title_core="Avène Sun krema SPF50 50 ml",
+                   meta="Avène Sun krema SPF50 za zaštitu lica, 50 ml. Vrlo "
+                        "visoka zaštita od UVA i UVB zraka.",
+                   namjena="za zaštitu lica",
+                   specs_used=["patentirani filter nove generacije"])
+check("nedoslovna specifikacija je greška",
+      any("nije doslovno pronađena" in e for e in
+          S.validate_candidate(kand, prod_s, page_s, set(), set())))
+
+# SEO t.6 uspoređuje se količina pakiranja, ne svaki broj
+kand2 = S.Candidate(title_core="Solgar Vitamin K1 100 mcg 100 tableta",
+                    meta="Solgar Vitamin K1 100 mcg za odrasle, 100 tableta. "
+                         "Vitamin K doprinosi normalnom zgrušavanju krvi.",
+                    namjena="za odrasle",
+                    specs_used=["Vitamin K doprinosi normalnom zgrušavanju krvi"])
+prod_k = S.Product("V", "Solgar", "C2", "SOLGAR VITAMIN K1 100 MCG 100 TABLETA",
+                   "https://eljekarna24.hr/y/")
+page_k = S.PageData(fetched=True, content="Solgar Vitamin K1 100 mcg, 100 tableta, "
+                                          "za odrasle. Vitamin K doprinosi "
+                                          "normalnom zgrušavanju krvi.")
+check("jačina (100 mcg) nije količina pakiranja",
+      S.validate_candidate(kand2, prod_k, page_k, set(), set()) == [],
+      str(S.validate_candidate(kand2, prod_k, page_k, set(), set())[:2]))
+check("količina pakiranja se čita ispravno",
+      R.kolicina_pakiranja("Solgar Vitamin K1 100 mcg 100 tableta") == "100 tableta")
+
+# PDP t.2 placeholder kad podatak postoji je greška
+inv_doza = X.parse_inventory(json.dumps({"cinjenice": [
+    {"polje": "doza", "vrijednost": "2 kapsule dnevno uz večernji obrok",
+     "izvor": "[S1]", "status": "FOUND"}]}, ensure_ascii=False), "supplement")
+md_ph2 = T.EXAMPLES["supplement"]
+check("placeholder umjesto pronađene doze je greška",
+      any("mora biti upisan" in p for p in
+          X.placeholder_instead_of_value(inv_doza, md_ph2)))
 
 print()
 if FAILURES:
