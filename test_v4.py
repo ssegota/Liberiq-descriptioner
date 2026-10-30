@@ -190,10 +190,14 @@ check("obrazac: naziv na početku kad je zadan kut",
 check("kontrola serije: isti početak",
       ima(v(MD, up=P.Upute(obrazac="x", obrazac_opis="kutom proizvoda",
                            zauzeti_poceci=["Bez metalnog okusa, jer"])), "Kontrola serije"))
-usp = SRC + [P.Source("S2", P.KIND_COMPARE, "https://primapharme.hr/x", "t",
+RECENICA = ("Sadržaj vrećice otapa se izravno u ustima, pa ne trebate gutati "
+            "tabletu ni kapsulu niti pripremati napitak.")
+usp = [P.Source("S1", P.KIND_PRIMARY, PROD.url, "t", MD.replace(RECENICA, ""))] + [P.Source("S2", P.KIND_COMPARE, "https://primapharme.hr/x", "t",
                       "Sadržaj vrećice otapa se izravno u ustima, pa ne trebate gutati "
                       "tabletu ni kapsulu niti pripremati napitak.", razina=3)]
 check("kopiran tekst usporedne ljekarne se hvata", ima(v(MD, src=usp), "usporedne"))
+check("isti tekst na eLjekarni24 smije se preuzeti",
+      not ima(v(MD, src=SRC + usp[1:]), "usporedne"))
 
 print("\n=== Validator: Template C (NAN, početna formula) ===")
 MDC = T.primjer_za("C")

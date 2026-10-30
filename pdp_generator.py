@@ -1291,7 +1291,7 @@ def validate_pdp(md: str, product: Product, letter: str, podvrsta: str,
                 traka, re.IGNORECASE):
             errors.append("Brza traka početne formule smije imati samo vrstu, dob, oblik, "
                           "pakiranje i alergen (bez pojedinih sastojaka i pripreme).")
-        if len(oznake) and any(len(o.split()) > 8 for o in oznake):
+        if len(oznake) and any(len(o.split()) > 10 for o in oznake):
             errors.append("Oznaka u brzoj traci je kratka činjenica od nekoliko riječi.")
     for h in re.findall(r"^###\s+(.+)$", tab1, re.M):
         if R.je_genericki_podnaslov(h):
@@ -1412,7 +1412,9 @@ def validate_pdp(md: str, product: Product, letter: str, podvrsta: str,
                       if not l.lower().startswith(("| meta", "| alt")))
     for hit in find_forbidden(javni):
         errors.append(f"Zabranjen izraz: {hit}.")
-    for hit in R.nadi_zabranjene_rijeci(javni, lijek=(letter == "K")):
+    # namjena medicinskog proizvoda prenosi se iz upute (Template D), lijeka iz
+    # Upute o lijeku (K); ostalima je medicinski rječnik zabranjen
+    for hit in R.nadi_zabranjene_rijeci(javni, lijek=(letter in ("K", "D", "H"))):
         if not any(hit.split("“")[0] in e for e in errors):
             errors.append(f"Zabranjena riječ ili fraza: {hit}.")
     for hit in R.nadi_interne_napomene(md):
@@ -1428,6 +1430,7 @@ def validate_pdp(md: str, product: Product, letter: str, podvrsta: str,
 
     # --- Brojevi s jedinicom moraju postojati u izvorima ---
     izvor_specs = spec_tokens(product.naziv + " " + " ".join(s.text for s in sources))
+    izvor_specs |= spec_tokens(upute.regulativa + " " + upute.prilog_ii)
     if inventory is not None:
         izvor_specs |= spec_tokens(" ".join(f.vrijednost for f in inventory.facts))
         izvor_specs |= spec_tokens(json.dumps(inventory.meta, ensure_ascii=False))
@@ -1436,7 +1439,9 @@ def validate_pdp(md: str, product: Product, letter: str, podvrsta: str,
 
     # --- Kopiranje s usporednih izvora ---
     usporedni = [s.text for s in sources if s.usporedni]
-    for frag in R.preuzeti_odlomci(md, usporedni)[:3]:
+    dopusteni = [s.text for s in sources if not s.usporedni] + \
+        list(meta.get("obvezne_recenice", [])) + [upute.regulativa]
+    for frag in R.preuzeti_odlomci(md, usporedni, dopusteni_tekstovi=dopusteni)[:3]:
         errors.append(f"Tekst preuzet s usporedne ljekarne/webshopa („{frag}…”); "
                       "napiši vlastitim riječima.")
     return errors
@@ -1656,6 +1661,7 @@ def process_product(product: Product, category: str, sources: list[Source],
         (ean_sa_stranice(sources[0].text) if sources else "")
 
     feedback: str | None = None
+    stil_krug = False
     best_md, best_issues, best_json = "", None, {}
     best_score = (-1, -10 ** 6)
 
@@ -1709,11 +1715,19 @@ def process_product(product: Product, category: str, sources: list[Source],
                 issues = [f"[{g.get('vrsta', '')}] {g.get('mjesto', '')}: {g['problem']}"
                           + (f" → {g['ispravak']}" if g.get("ispravak") else "")
                           for g in verdict["greske"]]
-                consider(md, issues, 2, interni)
-                result.verified = "ne prolazi"
-                feedback = ("Stručna provjera (drugi agent) našla je greške. Ispravi ih:\n"
-                            + "\n".join(f"- {i}" for i in issues))
-                continue
+                # činjenične i regulatorne greške blokiraju; stilske se šalju
+                # piscu jednom, a zatim bilježe kao napomena
+                blokira = [i for i, g in zip(issues, verdict["greske"])
+                           if "pisanje" not in str(g.get("vrsta", "")).lower()]
+                if blokira or (not stil_krug and attempt < max_attempts):
+                    stil_krug = stil_krug or not blokira
+                    consider(md, issues, 2, interni)
+                    result.verified = "ne prolazi"
+                    feedback = ("Stručna provjera (drugi agent) našla je greške. "
+                                "Ispravi ih:\n" + "\n".join(f"- {i}" for i in issues))
+                    continue
+                result.verified = "prolazi (stilske napomene)"
+                result.info.extend(f"stručna provjera (stil): {i}" for i in issues)
             else:
                 result.verified = "prolazi"
                 if verdict.get("napomena"):

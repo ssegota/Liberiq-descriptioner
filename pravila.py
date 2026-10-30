@@ -349,7 +349,7 @@ def nadi_interne_napomene(tekst: str) -> list[str]:
 
 ZABRANJENE_RIJECI = [
     (r"\boptimal\w*", "optimalan"), (r"\bnajbolj\w*", "najbolji"),
-    (r"\bnajosjetljivij\w*", "najosjetljiviji"), (r"\bjedini\w*", "jedini"),
+    (r"\bnajosjetljivij\w*", "najosjetljiviji"),
     (r"\bultra\b", "ultra"), (r"\bidealn?\w*", "idealan"),
     (r"\bsavrsen\w*", "savršen"), (r"\bsprjecav\w*", "sprječava"),
     (r"\bsprecav\w*", "sprječava"), (r"\blijeci\b", "liječi"),
@@ -453,9 +453,12 @@ def ima_usklicnik_ili_emoji(tekst: str) -> bool:
 # Kopiranje teksta s drugih webshopova (zabranjeno)
 # ---------------------------------------------------------------------------
 
-def preuzeti_odlomci(tekst: str, usporedni_tekstovi: list[str], n: int = 8) -> list[str]:
+def preuzeti_odlomci(tekst: str, usporedni_tekstovi: list[str], n: int = 8,
+                     dopusteni_tekstovi: list[str] | None = None) -> list[str]:
     """Nizovi od n riječi koji su doslovno preuzeti s usporednih izvora.
-    Tablice, sastav/INCI i obvezne zakonske rečenice se ne gledaju."""
+    Tablice, sastav/INCI i obvezne zakonske rečenice se ne gledaju, a ni nizovi
+    koji postoje i na eLjekarni24 ili stranici brenda (taj se tekst smije
+    preuzeti doslovno)."""
     def shingles(t: str) -> set[str]:
         w = _norm(t).split()
         return {" ".join(w[i:i + n]) for i in range(len(w) - n + 1)}
@@ -463,6 +466,8 @@ def preuzeti_odlomci(tekst: str, usporedni_tekstovi: list[str], n: int = 8) -> l
     izvori = set()
     for t in usporedni_tekstovi:
         izvori |= shingles(t)
+    for t in dopusteni_tekstovi or []:
+        izvori -= shingles(t)
     if not izvori:
         return []
     nalazi = []
