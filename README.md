@@ -1,7 +1,10 @@
 # Liberiq Descriptioner
 
 Generator SEO title/meta tagova i PDP opisa proizvoda za **eljekarna24**, na
-Claude modelima preko **AWS Bedrocka**.
+Claude modelima preko **AWS Bedrocka**, prema klijentovim **PDP templateima
+ver.11** (11 templateova A–K) i checklistama za dodatke prehrani, biljne dodatke
+i dječju hranu. Pravila i što je gdje provedeno:
+**[README_KLIJENT_PRAVILA.md](README_KLIJENT_PRAVILA.md)** (odjeljak Verzija 4).
 
 Za svaki proizvod iz ulazne tablice alat prikupi izvore, generira sadržaj prema
 klijentovim pravilima, automatski ga provjeri (format, činjenice, potpunost) i
@@ -101,11 +104,13 @@ Run se može prekinuti i nastaviti — svaki obrađeni proizvod odmah se zapisuj
 | `--retry-review` | ponovno generiraj samo retke koji nisu OK |
 | `--force` | ignoriraj postojeće rezultate i kreni ispočetka |
 | `--max-attempts 3` | broj krugova ispravaka po proizvodu |
-| `--search-results 3` | broj web izvora prioriteta 3 |
-| `--no-secondary` | bez zadanog sekundarnog izvora |
+| `--search-results 3` | broj usporednih izvora (Vaše zdravlje, Prima Pharme…) |
+| `--pim-dir mapa` | HR ambalaža / deklaracija / PIM po proizvodu (SKU ili EAN u nazivu datoteke) |
+| `--workers 4` | koliko proizvoda se obrađuje istodobno |
+| `--no-secondary` | bez stranice brenda i usporednih izvora |
 | `--no-web-search` | samo stranica proizvoda |
 | `--no-fetch` | bez dohvaćanja išta (samo naziv iz tablice) |
-| `--no-verify` | preskoči kontrolora činjenica |
+| `--no-verify` | preskoči stručnu provjeru (drugi agent) |
 | `--no-extract` / `--no-coverage` | preskoči ekstrakciju / coverage check |
 | `--refresh-cache` | ponovno dohvati izvore |
 | `--prompts-dir prompts` | mapa s vanjskim promptovima |
@@ -137,13 +142,12 @@ datoteka), plus zbirni **Ukupni status**.
 
 | Status | Značenje |
 | --- | --- |
-| `OK` | prošlo sve kontrole |
-| `OK (skraćeno)` | SEO prošao nakon determinističkog skraćivanja |
-| `TREBA PROVJERA` | nešto nije prošlo ni nakon svih pokušaja |
-| `NEDOSTAJE PODATAK IZ IZVORA` | coverage check našao izgubljen podatak |
-| `CONFLICT / REVIEW` | izvori daju različite vrijednosti |
+| `OK` | prošlo sve kontrole i stručnu provjeru, bez crvenih oznaka |
+| `OK, PROVJERITI CRVENO` | prošlo sve; crveno označene podatke provjeriti na ambalaži prije objave |
+| `TREBA PROVJERA` | nešto nije prošlo ni nakon svih pokušaja (stupac Napomene) |
+| `ZAUSTAVLJENO` | zabranjena biljna vrsta (NN 160/2013, Prilog III.) |
 | `GREŠKA EKSTRAKCIJE` | nije moguće pouzdano izvući strukturirana polja |
-| `GREŠKA` | nema stranice proizvoda (SEO zahtijeva izvor 1) |
+| `GREŠKA` | nema stranice proizvoda na eLjekarni24 |
 
 Retke koji nisu OK regeneriraj s `--retry-review`.
 
@@ -155,15 +159,18 @@ Retke koji nisu OK regeneriraj s `--retry-review`.
 ULAZNA TABLICA
      │
      ├─ izvori (jedan dohvat, dijeljen između oba alata)
-     │    prioritet 1: stranica proizvoda s linka
-     │    prioritet 2: webljekarna.vasezdravlje.com
-     │    prioritet 3: ostali web izvori
+     │    razina 1: HR ambalaža / deklaracija / PIM (--pim-dir)
+     │    razina 2: eLjekarna24 + službena stranica brenda
+     │    razina 3: Vaše zdravlje, Prima Pharme (+ Notino, MAKEUP, Douglas za kozmetiku)
      │
-     ├─ PDP:  ekstrakcija → pisac → kontrola formata → fact-check → coverage check
+     ├─ PDP:  klasifikacija (template A–K, podvrsta) → ekstrakcija (isti proizvod?)
+     │        → regulativa u kodu (tvrdnje 432/2012, % PU, NN 160/2013, obrazac prve
+     │          rečenice prema EAN-u) → pisac (pravila + template + checklista)
+     │        → automatska kontrola → coverage → stručna provjera (drugi agent)
      │            └── iz PDP-a izlazi kanonski naziv proizvoda
      │
      └─ SEO:  generiranje → pikselska i sadržajna kontrola → ispravci
-                  (title mora počinjati kanonskim nazivom iz PDP-a)
+                  (title počinje kanonskim nazivom; title i meta upisuju se u PDP)
 ```
 
 Detaljna pravila i gdje su provedena: **[README_KLIJENT_PRAVILA.md](README_KLIJENT_PRAVILA.md)**.
@@ -193,9 +200,13 @@ Upute: **[README_PROMPTOVI.md](README_PROMPTOVI.md)**.
 | --- | --- |
 | `generate_all.py` | objedinjeni runner (SEO + PDP, jedan izlaz) |
 | `seo_meta_generator.py` | title i meta: generiranje, pikselsko mjerenje, validacija |
-| `pdp_generator.py` | PDP: izvori, pisac, kontrola formata, fact-check |
-| `pdp_extract.py` | strukturirana ekstrakcija i coverage check |
-| `pdp_templates.py` | predlošci i primjeri po kategorijama |
+| `pdp_generator.py` | PDP: izvori, klasifikacija, pisac, automatska kontrola, stručna provjera, DOCX |
+| `pdp_extract.py` | strukturirana ekstrakcija, klasifikacija i coverage check |
+| `pdp_templates.py` | metapodaci templateova A–K (tabovi, tablica podataka, FAQ, tvrdnje) |
+| `regulativa.py` | tvrdnje 432/2012, % PU, najveće doze, Prilozi II. i III. NN 160/2013, obrazac prve rečenice |
+| `predlosci/` | klijentovi dokumenti ver.11 (doslovno u promptu) i odobreni primjeri |
+| `regulativa/` | dokument tvrdnji (JSON) i prilozi Pravilnika NN 160/2013 |
+| `alati/uvezi_predloske.py` | uvoz nove verzije klijentovih dokumenata |
 | `prompts_cfg.py` | vanjski promptovi i napomene |
 | `test_*.py` | offline testovi (bez Bedrocka) |
 
@@ -207,12 +218,15 @@ Oba generatora rade i samostalno (`python seo_meta_generator.py -i …`,
 ## Testovi
 
 ```bash
-make test          # ili: python test_klijent.py && python test_all.py && python test_prompts.py
+make test          # test_v4, test_upute, test_klijent, test_all, test_prompts
 ```
 
 Testovi ne zovu Bedrock ni mrežu — koriste mock klijente, pa su besplatni i
 brzi. Pokrivaju klijentova pravila, hijerarhiju izvora, coverage check,
-pikselsko mjerenje, skraćivanje koje čuva količinu i MD→DOCX konverziju.
+pikselsko mjerenje, skraćivanje koje čuva količinu i MD→DOCX konverziju, a
+`test_v4.py` pravila templatea ver.11: tvrdnje i uvjete, % PU, najveće doze,
+odabir templatea, obrasce prve rečenice, validator na odobrenim primjerima i
+scraping eLjekarne24.
 
 ---
 

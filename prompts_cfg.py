@@ -117,24 +117,28 @@ ugrađenog prompta pisca.
 
 - (primjer) Obraćanje kupcu uvijek na "vi".
 """,
-    "pdp_napomene_cosmetics": """<!--
-Napomene samo za kozmetiku. Dodaju se uz pdp_napomene.md.
+    "pdp_napomene_A": """<!--
+Napomene samo za dodatke prehrani (Template A). Dodaju se uz pdp_napomene.md.
+(Za ostale templateove napravi pdp_napomene_<slovo>.md, npr. pdp_napomene_K.md.)
 -->
 """,
-    "pdp_napomene_supplement": """<!--
-Napomene samo za dodatke prehrani. Dodaju se uz pdp_napomene.md.
+    "pdp_napomene_B": """<!--
+Napomene samo za kozmetiku i dermokozmetiku (Template B). Dodaju se uz pdp_napomene.md.
+(Za ostale templateove napravi pdp_napomene_<slovo>.md, npr. pdp_napomene_K.md.)
 -->
 """,
-    "pdp_napomene_device": """<!--
-Napomene samo za uređaje i medicinske proizvode. Dodaju se uz pdp_napomene.md.
+    "pdp_napomene_C": """<!--
+Napomene samo za hranu za dojenčad i dječju hranu (Template C). Dodaju se uz pdp_napomene.md.
+(Za ostale templateove napravi pdp_napomene_<slovo>.md, npr. pdp_napomene_K.md.)
 -->
 """,
-    "pdp_napomene_formula": """<!--
-Napomene samo za mliječne formule. Dodaju se uz pdp_napomene.md.
+    "pdp_napomene_D": """<!--
+Napomene samo za medicinske uređaje (Template D). Dodaju se uz pdp_napomene.md.
+(Za ostale templateove napravi pdp_napomene_<slovo>.md, npr. pdp_napomene_K.md.)
 -->
 """,
     "verify_napomene": """<!--
-Napomene za kontrolora činjenica (drugi agent). Ovdje se navodi što dodatno
+Napomene za stručnu provjeru (drugi agent). Ovdje se navodi što dodatno
 treba prijaviti ili što se izričito NE prijavljuje.
 -->
 """,
@@ -160,21 +164,18 @@ OVERRIDE ugrađenog PDP prompta pisca. Dok ova datoteka postoji, u cijelosti
 zamjenjuje ugrađeni prompt. Za obične dopune koristi pdp_napomene*.md.
 
 Dostupni placeholderi:
-  {kategorija}  - naziv kategorije (npr. kozmetika)
-  {tabovi}      - popis obveznih naziva tabova za tu kategoriju
-  {brza_traka}  - obvezna linija polja brze trake
-  {extra}       - ugrađene posebne upute kategorije
-  {PLACEHOLDER_UNKNOWN} {PLACEHOLDER_ORIGIN}
+  {kategorija}  - template (npr. „B: Kozmetika i dermokozmetika”)
 
-Pozor: nazivi tabova, obvezne rečenice i struktura provjeravaju se
-deterministički u pdp_generator.py (validate_pdp) i pdp_templates.py.
+Pravila klijenta (opća pravila, templateovi, checkliste) su u mapi predlosci/
+i već su sadržana u ovom promptu. Nazivi tabova, tablica podataka, obvezne
+rečenice i tvrdnje provjeravaju se deterministički u pdp_generator.py
+(validate_pdp), pdp_templates.py i regulativa.py.
 -->
 
 """,
     "verify_system": """<!--
-OVERRIDE prompta kontrolora činjenica. Format odgovora (JSON s poljima
-"prolazi", "nepotkrijepljene_tvrdnje", "napomena") mora ostati nepromijenjen jer
-ga kod parsira.
+OVERRIDE prompta stručne provjere. Format odgovora (JSON s poljima
+"prolazi", "greske", "napomena") mora ostati nepromijenjen jer ga kod parsira.
 -->
 
 """,
@@ -200,7 +201,7 @@ def init(dir_path=None) -> Path:
 
     samples = {
         "seo_system": S.build_system_prompt(),
-        "pdp_system": P.build_gen_system("cosmetics"),
+        "pdp_system": P.build_gen_system("B"),
         "verify_system": P.VERIFY_SYSTEM_DEFAULT,
     }
     for name, text in samples.items():

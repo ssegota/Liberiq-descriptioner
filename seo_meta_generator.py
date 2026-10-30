@@ -67,9 +67,12 @@ TITLE_MAX_PX = 550.0          # tvrdi limit za cijeli title (s dodatkom)
 META_MAX_PX = 960.0           # tvrdi limit za meta opis
 TITLE_FONT_PX = 20.0          # Google SERP: title ~ Arial 20 px (desktop)
 META_FONT_PX = 14.0           # Google SERP: opis ~ Arial 14 px (desktop)
-BRAND_SUFFIX = " | eljekarna24"   # U+007C (klijent: NE koristiti │ U+2502)
+BRAND_SUFFIX = " │ eLjekarna24"   # U+2502, PDP template ver.11 (prije: U+007C)
 
-META_TARGET_CHARS = "120–150"  # samo smjernica modelu; mjerodavni su pikseli
+META_TARGET_CHARS = "120–155"  # template ver.11: „do ~155 znakova”
+META_MAX_CHARS = 160
+SLOGAN_RE = re.compile(r"\b(za|protiv) (imunitet\w*|srce|energij\w*|razvoj\w*|kosti|"
+                       r"probav\w*|umor\w*|san|spavanje|mozak|pamcenj\w*)\b")
 
 SYSTEM_PROMPT_HEADER = (
     'Ti si SEO specijalist za hrvatsku internetsku ljekarnu "eljekarna24". '
@@ -797,7 +800,8 @@ U "podaci_s_brend_stranice" navedi SAMO podatke preuzete s označenog izvora
 def build_user_message(product: Product, page: PageData,
                        feedback: str | None = None,
                        canonical_name: str = "",
-                       brand_source: "BrandSource | None" = None) -> str:
+                       brand_source: "BrandSource | None" = None,
+                       dodatne_upute: str = "") -> str:
     content = page.content if page.fetched and page.content else (
         "SADRŽAJ STRANICE NIJE DOSTUPAN — koristi samo podatke iz naziva "
         "i ne navodi specifikacije kojih nema u nazivu."
@@ -822,7 +826,7 @@ URL: {product.url}
 SADRŽAJ STRANICE PROIZVODA — eljekarna24 (primarni izvor):
 <<<
 {content}
->>>{brand_block}
+>>>{brand_block}{dodatne_upute and chr(10) * 2 + "UPUTE IZ PDP TEMPLATEA ZA OVAJ PROIZVOD (imaju prednost):" + chr(10) + dodatne_upute}
 
 Generiraj title (bez dodatka webshopa) i meta opis prema pravilima.
 Vrati samo JSON."""
@@ -1006,6 +1010,14 @@ def validate_candidate(cand: Candidate, product: Product, page: PageData,
                 f"Meta opis predug: {px:.0f} px, limit {META_MAX_PX:.0f} px. "
                 f"Skrati na ~{META_TARGET_CHARS} znakova."
             )
+        if len(meta) > META_MAX_CHARS:
+            errors.append(f"Meta opis ima {len(meta)} znakova; template ver.11 "
+                          f"dopušta do ~155 (najviše {META_MAX_CHARS}).")
+    for tekst, gdje in ((title, "titlu"), (meta, "meta opisu")):
+        m = SLOGAN_RE.search(norm_spaced(tekst or ""))
+        if m:
+            errors.append(f"Skraćeni zdravstveni slogan u {gdje}: „{m.group(0)}” "
+                          "(template ver.11: bez „za imunitet”, „za srce”…).")
         tokens = significant_name_tokens(product.naziv)
         if tokens:
             nm = norm_compact(meta)
@@ -1201,12 +1213,22 @@ def dodaj_varijantu(title: str, izvor_naziv: str) -> str:
     return title
 
 
-def finalize_title(core: str) -> tuple[str, float, str]:
-    """Dodaje ' | eljekarna24' samo ako ukupno stane u 550 px (pravilo klijenta)."""
+def finalize_title(core: str, obavezno: list[str] | None = None) -> tuple[str, float, str]:
+    """Meta title je „[naziv, vrsta ili oblik, pakiranje] │ eLjekarna24”
+    (PDP template ver.11): nastavak ostaje, a naziv se po potrebi skraćuje po
+    cijelim segmentima (brend, linija, tip, varijanta i količina ostaju). Tek ako
+    ni tada ne stane u 550 px, nastavak se izostavlja."""
     full = core + BRAND_SUFFIX
     px = text_width_px(full, TITLE_FONT_PX)
     if px <= TITLE_MAX_PX:
         return full, px, ""
+    kraci = R.skrati_po_segmentima(
+        core, stane=lambda t: text_width_px(t, TITLE_FONT_PX) <= TITLE_CORE_TARGET_PX,
+        obavezno=obavezno if obavezno is not None else obavezni_pojmovi(core))
+    if kraci and text_width_px(kraci + BRAND_SUFFIX, TITLE_FONT_PX) <= TITLE_MAX_PX:
+        full = kraci + BRAND_SUFFIX
+        return full, text_width_px(full, TITLE_FONT_PX), \
+            "naziv u titlu skraćen da stane nastavak │ eLjekarna24"
     px_core = text_width_px(core, TITLE_FONT_PX)
     return core, px_core, "dodatak webshopa izostavljen (ne stane u 550 px)"
 
@@ -1218,7 +1240,8 @@ def finalize_title(core: str) -> tuple[str, float, str]:
 def process_product(product: Product, page: PageData, client: BedrockClient,
                     seen_titles: set[str], seen_metas: set[str], lock: threading.Lock,
                     max_attempts: int, canonical_name: str = "",
-                    brand_source: "BrandSource | None" = None) -> RowResult:
+                    brand_source: "BrandSource | None" = None,
+                    dodatne_upute: str = "") -> RowResult:
     """canonical_name: naziv iz PDP-a (klijent: title mora početi TIM nazivom).
     brand_source: izvor 2 (službena stranica brenda) — koristi se samo za
     podatke kojih nema na eljekarna24 i svaki takav podatak se označava."""
@@ -1242,7 +1265,8 @@ def process_product(product: Product, page: PageData, client: BedrockClient,
         result.attempts = attempt
         raw = client.generate(system_prompt,
                               build_user_message(product, page, feedback,
-                                                 canonical_name, brand_source))
+                                                 canonical_name, brand_source,
+                                                 dodatne_upute))
         cand = parse_model_json(raw)
         if cand is None:
             feedback = ("Odgovor nije bio valjan JSON s poljima 'title' i "
@@ -1325,7 +1349,8 @@ def process_product(product: Product, page: PageData, client: BedrockClient,
             stane=lambda t: text_width_px(t, TITLE_FONT_PX) <= TITLE_MAX_PX,
             obavezno=obavezni_pojmovi(canonical_name or product.naziv))
         result.info.append("title skraćen na 550 px")
-    result.title, result.title_px, suffix_note = finalize_title(title_core)
+    result.title, result.title_px, suffix_note = finalize_title(
+        title_core, obavezni_pojmovi(canonical_name or product.naziv))
     result.meta = meta
     result.meta_px = text_width_px(meta, META_FONT_PX)
     if suffix_note:

@@ -1,51 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Generator PDP sadržaja (opisa proizvoda s tabovima) za eljekarna24
-— Claude Opus na AWS Bedrock, dva agenta: pisac + kontrolor činjenica.
+Generator PDP opisa za eLjekarna24 prema PDP templateima verzije 11
+(Claude na AWS Bedrocku).
 
 Za svaki proizvod iz ulazne tablice (Sekcija, Brend, SKU, Naziv, URL):
 
-  1. IZVORI: dohvaća stranicu proizvoda (eljekarna24) i dodatne izvore s
-     interneta (DuckDuckGo pretraga, prednost službenim stranicama brenda).
-     Svaki izvor dobiva oznaku [S1], [S2] ... i sprema se u cache.
-  2. PISAC (Claude Opus): generira PDP u Markdownu, STROGO prema predlošku
-     kategorije iz PDP_struktura.docx i četiri primjera (kozmetika, dodatak
-     prehrani, uređaj, mliječna formula). Predlošci žive u pdp_templates.py.
-  3. AUTOMATSKA KONTROLA FORMATA (deterministička): točni naslovi sekcija i
-     tabova, "Brza traka" polja, 3–4 ključne prednosti, Tab 1 od 80 do 150
-     riječi, obvezni redci Tab 5 (Pakiranje/Brend/Proizvođač/Zemlja
-     podrijetla/EAN/Obvezna provjera), fiksni Tab 6 i blok recenzija, FAQ s
-     3–5 pitanja, obvezne rečenice po kategoriji (npr. "Dojenje je najbolji
-     način prehrane dojenčeta." za formule), zabranjeni izrazi (cijene,
-     akcije, dostava, CTA, superlativi, "klinički dokazano", liječi/jamči),
-     EAN samo ako postoji u izvorima, svaki broj s jedinicom mora postojati
-     u izvorima.
-  4. KONTROLOR (drugi agent, Claude na Bedrocku): provjerava svaku činjeničnu
-     tvrdnju prema izvorima; nepotkrijepljene tvrdnje vraćaju se piscu.
-  5. Greške se vraćaju modelu na ispravak do --max-attempts puta.
-  6. IZLAZ po proizvodu: PDP_<SKU>_<naziv>.md i .docx + zbirni indeks
-     (XLSX/CSV) sa statusima. results.jsonl omogućuje nastavak prekinutog rada.
-
-Pokretanje:
-    pip install -r requirements.txt
-    cp .env.example .env   # isti .env kao za bedrock-test.py / seo_meta_generator.py
-    python pdp_generator.py --input eljekarna24_proizvodi_75_kom.xlsx
-
-Korisne opcije:
-    --limit 2            samo prva 2 proizvoda (test)
-    --sku C002167        samo jedan SKU (može više puta)
-    --dry-run            bez Bedrocka: skupi izvore i ispiši prompt
-    --no-web-search      bez internetske pretrage (samo stranica proizvoda)
-    --no-verify          preskoči drugog agenta (ne preporučuje se)
-    --search-results 3   koliko web izvora po proizvodu
-    --force              ignoriraj postojeće rezultate
-    --retry-review       ponovno generiraj samo retke koji nisu OK
+  1. IZVORI po razinama iz općih pravila templatea:
+       razina 1  HR ambalaža / deklaracija / PIM (lokalne datoteke, --pim-dir)
+       razina 2  eLjekarna24 (URL iz tablice) i službena stranica brenda
+       razina 3  Vaše zdravlje, Prima Pharme; za kozmetiku i parfeme i
+                 Notino, MAKEUP, Douglas — samo za usporedbu, tekst se ne kopira
+  2. KLASIFIKACIJA: koji template (A–K) i koja podvrsta (npr. početna formula,
+     biljni dodatak prehrani) — prema uputi „Koji template se koristi” iz
+     dokumenta kategorije i deklaraciji proizvoda.
+  3. EKSTRAKCIJA činjenica (inventar) + provjera je li svaki izvor isti
+     proizvod i pakiranje.
+  4. REGULATIVA u kodu (regulativa.py): % PU, dopuštene tvrdnje iz Uredbe
+     432/2012 s provjerenim uvjetom, najveće doze (NN 160/2013), zabranjene
+     biljke, obrazac prve rečenice prema EAN-u.
+  5. PISAC: dobiva doslovno opća pravila, template, checklistu kategorije i
+     odobreni primjer, uz izračune iz koraka 4.
+  6. DETERMINISTIČKA KONTROLA: struktura, tabovi, tablica podataka, obvezne
+     napomene, blok tvrdnji (svaka tvrdnja mora biti iz dokumenta tvrdnji),
+     zabranjene fraze, navođenje izvora, kopiranje s drugih webshopova,
+     šablonski počeci, kontrola serije.
+  7. STRUČNA PROVJERA (drugi agent): činjenice prema izvorima i regulatorna
+     pravila kategorije; greške se vraćaju piscu.
+  8. IZLAZ: PDP_<SKU>_<naziv>.md i .docx (neprovjereni podaci crvenom bojom,
+     u MD-u kao [PROVJERITI: …]) + tablica izvora na kraju dokumenta.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
 import os
@@ -59,54 +48,53 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import pdp_extract as X
-import pravila as R
 import pdp_templates as T
+import pravila as R
 import prompts_cfg
+import regulativa as G
 
 # ---------------------------------------------------------------------------
 # Konstante
 # ---------------------------------------------------------------------------
 
-GEN_MAX_TOKENS = 3500
-GEN_TEMPERATURE = 0.2
-VERIFY_MAX_TOKENS = 1200
-EXTRACT_MAX_TOKENS = 4000
+GEN_MAX_TOKENS = 8000
+GEN_TEMPERATURE = 0.3
+VERIFY_MAX_TOKENS = 3000
+EXTRACT_MAX_TOKENS = 8000
+VERIFY_TEMPERATURE = 0.0
+BEDROCK_RETRIES = 6
 
-# Strogi način (--strogo): nedostatak EAN-a ili proizvođača i korištenje
-# izvora 2 sami po sebi daju TREBA PROVJERA, doslovno po uputama.
+# Strogi način (--strogo): svaki crveno označeni podatak daje TREBA PROVJERA.
 STROGI_NACIN = False
 
 
 def postavi_strogi_nacin(vrijednost: bool) -> None:
     global STROGI_NACIN
     STROGI_NACIN = bool(vrijednost)
-VERIFY_TEMPERATURE = 0.0
-BEDROCK_RETRIES = 5
 
-PAGE_CONTENT_CAP = 6000       # znakova sa stranice proizvoda
-WEB_SOURCE_CAP = 2500         # znakova po web izvoru
-TAB1_MIN_WORDS, TAB1_MAX_WORDS = 80, 150
-FAQ_MIN, FAQ_MAX = 3, 5
+
+PAGE_CONTENT_CAP = 16000      # znakova sa stranice proizvoda (eLjekarna24)
+WEB_SOURCE_CAP = 9000         # znakova po ostalom izvoru
+LOCAL_SOURCE_CAP = 30000      # PIM / deklaracija
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0 Safari/537.36 eljekarna24-interni-pdp-alat"
 )
 
-# Hijerarhija izvora (klijent):
-#   prioritet 1 — stranica proizvoda s linka iz ulazne tablice (eljekarna24)
-#   prioritet 2 — zadani sekundarni izvor (webljekarna.vasezdravlje.com)
-#   prioritet 3 — svi ostali web izvori
-PRIMARY_DOMAIN = "eljekarna24"
-SECONDARY_LABEL = "webljekarna.vasezdravlje.com"
-TERTIARY_LABEL = "službena stranica brenda"
+KIND_PIM = "ambalaža / deklaracija / PIM"
+KIND_PRIMARY = "stranica proizvoda"           # eLjekarna24 (zadržan naziv)
+KIND_BRAND = "službena stranica brenda"
+KIND_COMPARE = "usporedni izvor"
 
-CATEGORY_QUERY_EXTRA = {
-    "cosmetics": "sastav INCI",
-    "supplement": "deklaracija sastav doziranje",
-    "device": "upute specifikacije",
-    "formula": "priprema sastav deklaracija",
-}
+# zadržano zbog kompatibilnosti sa starim zapisima
+SECONDARY_LABEL = KIND_BRAND
+TERTIARY_LABEL = KIND_COMPARE
+
+STATUS_OK = "OK"
+STATUS_PROVJERITI = "OK, PROVJERITI CRVENO"
+STATUS_REVIEW = "TREBA PROVJERA"
+STATUS_STOP = "ZAUSTAVLJENO"
 
 # ---------------------------------------------------------------------------
 # Normalizacija
@@ -133,16 +121,21 @@ def slugify(s: str, max_len: int = 60) -> str:
     return s[:max_len].rstrip("-") or "proizvod"
 
 
+def danas_hr() -> str:
+    d = dt.date.today()
+    return f"{d.day}. {d.month}. {d.year}."
+
+
 # ---------------------------------------------------------------------------
-# Zabranjeni izrazi (na normaliziranom tekstu) + izuzete obvezne rečenice
+# Zabranjeni izrazi (trgovina, superlativi, apsolutne tvrdnje)
 # ---------------------------------------------------------------------------
 
 EXEMPT_PATTERNS = [
-    # obvezna zakonska rečenica za mliječne formule sadrži "najbolji"
-    re.compile(r"dojenje je najbolji nacin prehrane dojenceta"),
-    # mjerni izrazi, nisu tvrdnje o kvaliteti
+    re.compile(r"dojenje je najbolji nacin prehrane\w*"),
+    re.compile(r"majcino mlijeko najbolja je hrana\w*"),
     re.compile(r"\bnajvise\b"), re.compile(r"\bnajmanje\b"),
     re.compile(r"\bnajkasnije\b"), re.compile(r"\bnajranije\b"),
+    re.compile(r"lijecnik\w*|lijecnick\w*"),
 ]
 
 FORBIDDEN_PATTERNS: list[tuple[re.Pattern, str]] = [
@@ -152,61 +145,41 @@ FORBIDDEN_PATTERNS: list[tuple[re.Pattern, str]] = [
         (r"\bakcij\w*", "akcija/promo"),
         (r"\bpopust\w*", "popust"),
         (r"\bsnizen\w*", "sniženje"),
-        (r"\brasprodaj\w*", "rasprodaja"),
         (r"\bgratis\b", "gratis/promo"),
         (r"\bdostav\w*", "dostava"),
-        (r"\bisporuka\b", "isporuka"),
-        (r"\bdostupnost\b", "dostupnost (podatak iz sustava, ne iz teksta)"),
         (r"\bna zalihi\b", "zaliha"),
-        (r"\bkosaric\w*", "košarica (element trgovine, ne PDP teksta)"),
+        (r"\bkosaric\w*", "košarica"),
         (r"\bnaruc\w*", "CTA: naruči"),
         (r"\bkupi(te)?\b", "CTA: kupi"),
-        (r"\bkupuj\w*", "CTA: kupujte"),
         (r"\bkliknite\b", "CTA"),
-        (r"\bsaznajte\b", "CTA: saznajte više"),
-        (r"\bposjetite\b", "CTA"),
+        (r"\bsaznajte\b", "CTA"),
         (r"\bnajbolj\w*", "superlativ"),
         (r"\bnajkvalitetnij\w*", "superlativ"),
-        (r"\bvrhunsk\w*", "neprovjereni superlativ"),
+        (r"\bvrhunsk\w*", "superlativ"),
         (r"\bsavrsen\w*", "superlativ"),
-        (r"\bcudesn\w*", "superlativ"),
-        (r"\bidealn?\w*", "neprovjeren superlativ (idealan/idealno)"),
-        (r"\bnajucinkovitij\w*", "definitivna tvrdnja (najučinkovitiji)"),
-        (r"\bnajdjelotvornij\w*", "definitivna tvrdnja"),
-        (r"\bnajjac\w*", "definitivna tvrdnja (najjači)"),
-        (r"\bnajsigurnij\w*", "definitivna tvrdnja (najsigurniji)"),
-        (r"\bnajnjeznij\w*", "definitivna tvrdnja (najnježniji)"),
-        (r"\bnajpopularnij\w*", "neprovjerena tvrdnja (najpopularniji)"),
-        (r"\bnajprodavanij\w*", "neprovjerena tvrdnja (najprodavaniji)"),
-        (r"\bnajbrz\w*", "definitivna tvrdnja (najbrži)"),
+        (r"\bidealn?\w*", "idealan"),
+        (r"\bnajucinkovitij\w*", "definitivna tvrdnja"),
+        (r"\bnajsigurnij\w*", "definitivna tvrdnja"),
         (r"\bnaj\w{3,}(iji|ija|ije|ijeg|ijem)\b", "superlativ"),
-        (r"\bjedini\w*\b", "isključiva tvrdnja (jedini)"),
         (r"\bnema premca\b", "definitivna tvrdnja"),
         (r"\bzlatni standard\b", "definitivna tvrdnja"),
+        (r"\buvijek djeluje\b", "apsolutna tvrdnja"),
         (r"\bprvi izbor\b", "definitivna tvrdnja"),
         (r"\bapsolutno\b", "apsolutna tvrdnja"),
-        (r"\buvijek djeluje\b", "apsolutna tvrdnja"),
         (r"\bsvima odgovara\b", "apsolutna tvrdnja"),
-        (r"\bbez iznimke\b", "apsolutna tvrdnja"),
-        (r"\bsigurno ce\b", "obećanje rezultata"),
         (r"\btrenutn\w* rezultat\w*", "obećanje rezultata"),
-        (r"\bodmah uklanja\b", "obećanje rezultata"),
-        (r"\bpotpuno bezopasan\w*", "apsolutna tvrdnja"),
-        (r"\bbez ikakvih nuspojava\b", "apsolutna tvrdnja"),
-        (r"\brevolucionar\w*", "superlativ"),
-        (r"\bbr(oj)?\.?\s?1\b", "superlativ (br. 1)"),
-        (r"\b100\s?%\s?(prirodn|ucinkovit|siguran)\w*", "neprovjerena tvrdnja"),
-        (r"\bklinicki dokazano\b", "gola tvrdnja 'klinički dokazano' bez metode"),
-        (r"\bdokazano djeluje\b", "gola tvrdnja bez metode"),
+        (r"\bpotpuna zastita\b|\bblokira sunce\b|\b100 ?% zastit\w*",
+         "zabranjena tvrdnja o zaštiti od sunca"),
+        (r"\bdokazano djeluje\b", "tvrdnja bez metode"),
         (r"\bjamci\w*", "jamstvo/tvrdnja"),
         (r"\bgarantira\w*", "jamstvo/tvrdnja"),
-        (r"\blijeci\b", "medicinska tvrdnja (liječi)"),
-        (r"\bizlijec\w*", "medicinska tvrdnja (izliječi)"),
+        (r"\bpatentiran\w*|\bnajnoviji\w*|\bnajnapredniji\w*", "pridjev koji hvali proizvod"),
     ]
 ]
 
-HEDGE_PHRASES = ["prema deklaraciji", "prema podacima proizvoda", "prema uputi",
-                 "prema opisu proizvoda", "prema dostupnoj dokumentaciji"]
+# Skraćeni zdravstveni slogani (SEO, H1, podnaslovi, brza traka).
+SLOGAN_RE = re.compile(r"\b(za|protiv) (imunitet\w*|srce|energij\w*|razvoj\w*|kosti|"
+                       r"probav\w*|umor\w*|san|spavanje|mozak|pamcenj\w*)\b")
 
 
 def find_forbidden(text: str) -> list[str]:
@@ -224,22 +197,26 @@ def find_forbidden(text: str) -> list[str]:
 
 
 SPEC_TOKEN_RE = re.compile(
-    r"\b(\d+(?:[.,]\d+)?)\s*"
-    r"(ml|mg|g|kg|l|mcg|iu|ie|kom|cm|kapsul\w*|tablet\w*|vrecic\w*|%)\b"
+    r"\b(\d+(?:d\d+)?)\s*"
+    r"(ml|mg|g|kg|l|mcg|µg|iu|ie|kom|cm|kapsul\w*|tablet\w*|vrecic\w*)\b"
 )
 SPF_RE = re.compile(r"\bspf\s*(\d+\+?)\b")
 UNIT_STEMS = ("kapsul", "tablet", "vrecic")
 
 
 def spec_tokens(text: str) -> set[str]:
-    normed = norm_spaced(text)
+    text = re.sub(r"(?m)^\s*\d+\.\s+", " ", text or "")       # „2. Kapsulu uzmite…”
+    text = re.sub(r"(\d)[.,](\d)", r"\1d\2", text)             # 2,5 -> 2d5 (decimale)
+    normed = norm_spaced(text.replace("µg", " mcg").replace("μg", " mcg"))
     out = set()
     for num, unit in SPEC_TOKEN_RE.findall(normed):
         for stem in UNIT_STEMS:
             if unit.startswith(stem):
                 unit = stem
                 break
-        out.add(num.replace(",", ".") + unit)
+        if "d" in num:                                         # 2d50 -> 2.5
+            num = num.replace("d", ".").rstrip("0").rstrip(".")
+        out.add(num + unit)
     for val in SPF_RE.findall(normed):
         out.add("spf" + val)
     return out
@@ -260,23 +237,31 @@ class Product:
 
 @dataclass
 class Source:
-    sid: str            # "S1", "S2", ...
-    kind: str           # "stranica proizvoda" | "web"
+    sid: str
+    kind: str
     url: str
     title: str = ""
     text: str = ""
+    razina: int = 2
+    datum: str = field(default_factory=danas_hr)
+
+    @property
+    def usporedni(self) -> bool:
+        return self.kind == KIND_COMPARE
 
 
 @dataclass
 class RowResult:
     product: Product
     category: str = ""
-    status: str = "TREBA PROVJERA"
+    podvrsta: str = ""
+    klasifikacija: str = ""
+    status: str = STATUS_REVIEW
     attempts: int = 0
     verified: str = "-"
     unsupported: list = field(default_factory=list)
     notes: list = field(default_factory=list)
-    sources: list = field(default_factory=list)   # list[Source]
+    sources: list = field(default_factory=list)
     md_path: str = ""
     docx_path: str = ""
     model_id: str = ""
@@ -284,7 +269,11 @@ class RowResult:
     coverage: list = field(default_factory=list)
     conflicts: list = field(default_factory=list)
     nedostaje: list = field(default_factory=list)
-    info: list = field(default_factory=list)      # informativno, ne blokira
+    provjeriti: list = field(default_factory=list)
+    regulatorno: list = field(default_factory=list)
+    info: list = field(default_factory=list)
+    prva_recenica: str = ""
+    obrazac: str = ""
 
     def to_record(self) -> dict:
         return {
@@ -294,6 +283,8 @@ class RowResult:
             "Naziv": self.product.naziv,
             "URL": self.product.url,
             "Kategorija predloška": T.CATEGORY_LABELS.get(self.category, self.category),
+            "Podvrsta": self.podvrsta,
+            "Klasifikacija": self.klasifikacija,
             "Status": self.status,
             "Pokušaji": self.attempts,
             "Verifikacija (2. agent)": self.verified,
@@ -304,9 +295,12 @@ class RowResult:
                                " | ".join(self.coverage[:4])),
             "Konflikt izvora": " | ".join(self.conflicts),
             "Nedostaje": " | ".join(self.nedostaje),
+            "Za provjeru (crveno)": " | ".join(self.provjeriti),
+            "Regulatorno": " | ".join(self.regulatorno),
+            "Obrazac prve rečenice": self.obrazac,
             "Informativno": " | ".join(self.info),
             "Broj izvora": len(self.sources),
-            "Izvori": " | ".join(s.url for s in self.sources),
+            "Izvori": " | ".join(f"{s.sid} {s.kind}: {s.url}" for s in self.sources),
             "MD datoteka": self.md_path,
             "DOCX datoteka": self.docx_path,
             "Napomene": " | ".join(self.notes),
@@ -319,7 +313,7 @@ class RowResult:
 # ---------------------------------------------------------------------------
 
 def _cache_get_or_fetch(url: str, cache_dir: Path, refresh: bool,
-                        timeout: int = 20) -> str | None:
+                        timeout: int = 25) -> str | None:
     import requests
 
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -335,7 +329,7 @@ def _cache_get_or_fetch(url: str, cache_dir: Path, refresh: bool,
             return None
         cache_file.write_text(resp.text, encoding="utf-8", errors="ignore")
         return resp.text
-    except Exception:  # noqa: BLE001 — izvor koji ne radi jednostavno preskačemo
+    except Exception:  # noqa: BLE001 — izvor koji ne radi preskačemo
         return None
 
 
@@ -362,12 +356,52 @@ def _jsonld_products(soup) -> list[dict]:
     return found
 
 
-PRODUCT_SELECTORS = [
+def _structured_text(el) -> str:
+    """Tekst elementa sa sačuvanim odlomcima, natuknicama i tablicama."""
+    from bs4 import NavigableString
+
+    out: list[str] = []
+
+    def walk(node):
+        if isinstance(node, NavigableString):
+            out.append(str(node))
+            return
+        name = getattr(node, "name", "")
+        if name in ("script", "style", "noscript", "svg", "button", "form"):
+            return
+        if name == "tr":
+            cells = [c.get_text(" ", strip=True) for c in node.find_all(["th", "td"])]
+            out.append("\n| " + " | ".join(cells) + " |")
+            return
+        if name == "br":
+            out.append("\n")
+            return
+        if name == "li":
+            out.append("\n- ")
+        if name in ("p", "div", "ul", "ol", "table", "h1", "h2", "h3", "h4",
+                    "h5", "section", "dl"):
+            out.append("\n")
+        for child in node.children:
+            walk(child)
+        if name in ("p", "div", "li", "h1", "h2", "h3", "h4", "h5", "dt", "dd"):
+            out.append("\n")
+
+    walk(el)
+    text = "".join(out).replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"(?m)^-\n+", "- ", text)          # <li><p>…</p></li>
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+# eLjekarna24 je BigCommerce: cijeli opis je u .pv-desc-source (tabovi se
+# slažu JavaScriptom), kratki opis u .pv-desc-short, EAN u polju UPC.
+ELJ_SELECTORS = [".pv-desc-short", ".pv-desc-source"]
+LEGACY_SELECTORS = [
     ".woocommerce-product-details__short-description",
     ".woocommerce-Tabs-panel--description", "#tab-description",
-    "[itemprop='description']", ".product-short-description",
-    ".product_description", ".product-description", "#description",
-    ".entry-summary",
+    "[itemprop='description']", ".product-description", "#description",
+    ".productView-description",
 ]
 
 
@@ -377,43 +411,56 @@ def extract_product_page(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     parts: list[str] = []
 
-    for prod in _jsonld_products(soup):
-        desc = prod.get("description") or ""
-        if desc:
-            parts.append(BeautifulSoup(str(desc), "html.parser")
-                         .get_text(" ", strip=True))
-    og = soup.find("meta", attrs={"property": "og:description"})
-    if og and og.get("content"):
-        parts.append(" ".join(og["content"].split()))
-    for sel in PRODUCT_SELECTORS:
-        el = soup.select_one(sel)
-        if el:
-            txt = el.get_text(" ", strip=True)
+    title = soup.select_one(".productView-title, h1")
+    if title:
+        parts.append("NAZIV NA STRANICI: " + title.get_text(" ", strip=True))
+    brand = soup.select_one(".productView-brand, .product-brand")
+    if brand:
+        parts.append("BREND: " + brand.get_text(" ", strip=True))
+    info = soup.select_one(".productView-info")
+    if info:
+        names = [n.get_text(" ", strip=True).rstrip(":")
+                 for n in info.select(".productView-info-name")]
+        values = [v.get_text(" ", strip=True)
+                  for v in info.select(".productView-info-value")]
+        for n, v in zip(names, values):
+            if n.upper() == "UPC" and v:
+                parts.append(f"EAN (UPC na stranici): {v}")
+    for sel in ELJ_SELECTORS + LEGACY_SELECTORS:
+        for el in soup.select(sel):
+            txt = _structured_text(el)
             if len(txt) > 40:
                 parts.append(txt)
+    if len(" ".join(parts)) < 400:
+        for prod in _jsonld_products(soup):
+            desc = prod.get("description") or ""
+            if desc:
+                parts.append(BeautifulSoup(str(desc), "html.parser")
+                             .get_text("\n", strip=True))
+        og = soup.find("meta", attrs={"property": "og:description"})
+        if og and og.get("content"):
+            parts.append(" ".join(og["content"].split()))
     for table in soup.select("table.woocommerce-product-attributes, "
-                             "table.shop_attributes"):
-        for tr in table.find_all("tr"):
-            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
-            if len(cells) >= 2 and cells[0] and cells[1]:
-                parts.append(f"{cells[0]}: {cells[1]}")
+                             "table.shop_attributes, .productView-specs table"):
+        parts.append(_structured_text(table))
     if not parts:
         main = soup.find("main") or soup.find("article") or soup.body
         if main:
-            parts.append(main.get_text(" ", strip=True))
+            parts.append(_structured_text(main))
 
-    seen, lines = set(), []
+    seen, blocks = set(), []
     for part in parts:
-        for line in re.split(r"(?<=[.!?])\s+|\n", part):
-            line = " ".join(line.split())
-            if len(line) < 3:
-                continue
-            key = norm_compact(line)[:80]
-            if key in seen:
-                continue
-            seen.add(key)
-            lines.append(line)
-    return "\n".join(lines)[:PAGE_CONTENT_CAP]
+        key = norm_compact(part)[:200]
+        if key in seen:
+            continue
+        seen.add(key)
+        blocks.append(part)
+    return "\n\n".join(blocks)[:PAGE_CONTENT_CAP]
+
+
+def ean_sa_stranice(text: str) -> str:
+    m = re.search(r"EAN \(UPC na stranici\):\s*(\d{8,14})", text or "")
+    return m.group(1) if m else ""
 
 
 def extract_generic_page(html: str) -> tuple[str, str]:
@@ -422,132 +469,146 @@ def extract_generic_page(html: str) -> tuple[str, str]:
     soup = BeautifulSoup(html, "html.parser")
     title = " ".join(soup.title.get_text().split()) if soup.title else ""
     for tag in soup(["script", "style", "noscript", "nav", "header", "footer",
-                     "form", "iframe"]):
+                     "form", "iframe", "aside"]):
         tag.decompose()
-    main = soup.find("main") or soup.find("article") or soup.body
-    text = main.get_text(" ", strip=True) if main else ""
-    text = re.sub(r"\s+", " ", text)
+    main = (soup.select_one("[itemtype*='Product']") or soup.find("main")
+            or soup.find("article") or soup.body)
+    text = _structured_text(main) if main else ""
     return title, text[:WEB_SOURCE_CAP]
 
 
-def web_search_urls(product: Product, category: str, max_urls: int) -> list[dict]:
-    """DuckDuckGo pretraga; vraća [{'href':..., 'title':...}] rangirano."""
-    try:
-        try:
-            from ddgs import DDGS  # novije ime paketa
-        except ImportError:
-            from duckduckgo_search import DDGS  # starije ime
-    except ImportError:
-        return []
-
-    queries = [
-        f"{product.brend} {product.naziv}".strip(),
-        f"{product.brend} {product.naziv} {CATEGORY_QUERY_EXTRA[category]}".strip(),
-    ]
-    brand_tokens = [t for t in norm_spaced(product.brend).split() if len(t) >= 4]
-
-    results: dict[str, dict] = {}
-    for query in queries:
-        try:
-            with DDGS() as ddgs:
-                for hit in ddgs.text(query, region="hr-hr", max_results=8) or []:
-                    href = hit.get("href") or hit.get("url") or ""
-                    if not href.startswith("http"):
-                        continue
-                    host = urlparse(href).netloc.lower()
-                    if (PRIMARY_DOMAIN in host
-                            or href.lower().endswith(".pdf")):
-                        continue
-                    score = 1 + sum(2 for tok in brand_tokens if tok in
-                                    norm_compact(host))
-                    prev = results.get(href)
-                    if not prev or score > prev["score"]:
-                        results[href] = {"href": href,
-                                         "title": hit.get("title", ""),
-                                         "score": score}
-        except Exception:  # noqa: BLE001 — pretraga je opcionalna
-            continue
-        time.sleep(0.4)
-
-    ranked = sorted(results.values(), key=lambda r: -r["score"])
-    return ranked[:max_urls]
-
-
-def brand_site_urls(product: Product, max_urls: int = 2) -> list[str]:
-    """Stranice proizvoda na SLUŽBENIM hrvatskim domenama brenda (allowlist)."""
-    domene = [d for d in R.dopustene_domene(product.brend) if d != R.PRIMARNA_DOMENA]
-    nadjeno: list[str] = []
-    for domena in domene:
-        url = site_search_url(product, domena)
-        if url and R.je_dopusten(url, product.brend)[0]:
-            nadjeno.append(url)
-        if len(nadjeno) >= max_urls:
-            break
-    return nadjeno
-
-
-def site_search_url(product: Product, domain: str) -> str | None:
-    """Nađi stranicu ovog proizvoda na zadanoj domeni (site: pretraga)."""
+def _ddgs():
     try:
         try:
             from ddgs import DDGS
         except ImportError:
             from duckduckgo_search import DDGS
+        return DDGS
     except ImportError:
         return None
 
-    query = f"site:{domain} {product.brend} {product.naziv}".strip()
+
+def site_search_url(product: Product, domain: str) -> str | None:
+    """Stranica ovog proizvoda na zadanoj domeni (site: pretraga)."""
+    DDGS = _ddgs()
+    if DDGS is None:
+        return None
+    query = f"site:{domain} {product.naziv}".strip()
+    if product.brend and norm_compact(product.brend) not in norm_compact(product.naziv):
+        query = f"site:{domain} {product.brend} {product.naziv}"
     try:
         with DDGS() as ddgs:
-            for hit in ddgs.text(query, region="hr-hr", max_results=5) or []:
+            for hit in ddgs.text(query, region="hr-hr", max_results=6) or []:
                 href = hit.get("href") or hit.get("url") or ""
                 if href.startswith("http") and domain in urlparse(href).netloc.lower():
                     return href
-    except Exception:  # noqa: BLE001 — sekundarni izvor je neobavezan
+    except Exception:  # noqa: BLE001 — pretraga je neobavezna
         return None
     return None
 
 
-def gather_sources(product: Product, category: str, cache_dir: Path,
-                   refresh: bool, web_search: bool, max_web: int,
-                   secondary: bool = True) -> list[Source]:
-    """Izvori prema hijerarhiji iz uputa, provedenoj u kodu (allowlist domena):
-       1. stranica proizvoda na eljekarna24 (URL iz ulazne tablice),
-       2. službena hrvatska stranica brenda, samo za podatke kojih nema na 1.
-    Sve ostalo se odbacuje prije slanja modelu."""
-    sources: list[Source] = []
+def brand_site_urls(product: Product, max_urls: int = 1) -> list[str]:
+    """Stranica proizvoda na službenoj stranici brenda: prvo poznate HR domene
+    (pravila.BREND_DOMENE), zatim opća pretraga ograničena na domene brenda."""
+    domene = [d for d in R.BREND_DOMENE.get(R._norm_brend(product.brend), ())]
+    nadjeno: list[str] = []
+    for domena in domene:
+        url = site_search_url(product, domena)
+        if url and R.je_stranica_brenda(url, product.brend):
+            nadjeno.append(url)
+        if len(nadjeno) >= max_urls:
+            return nadjeno
+    DDGS = _ddgs()
+    if DDGS is None or nadjeno:
+        return nadjeno
+    naziv = product.naziv
+    if product.brend and norm_compact(product.brend) not in norm_compact(naziv):
+        naziv = f"{product.brend} {naziv}"
+    try:
+        with DDGS() as ddgs:
+            for hit in ddgs.text(naziv, region="hr-hr", max_results=10) or []:
+                href = hit.get("href") or hit.get("url") or ""
+                if href.startswith("http") and R.je_stranica_brenda(href, product.brend):
+                    nadjeno.append(href)
+                    break
+    except Exception:  # noqa: BLE001 — pretraga je neobavezna
+        pass
+    return nadjeno[:max_urls]
 
-    # --- izvor 1 ---
+
+def load_local_sources(product: Product, pim_dir: Path | None,
+                       ean: str = "") -> list[Source]:
+    """Razina 1: HR ambalaža, deklaracija, PIM ili uputa iz lokalne mape.
+    Datoteka se prepoznaje po SKU-u ili EAN-u u nazivu (npr. C002167_*.pdf)."""
+    if not pim_dir or not pim_dir.exists():
+        return []
+    keys = [k for k in (product.sku, ean) if k]
+    out = []
+    for path in sorted(pim_dir.rglob("*")):
+        if not path.is_file() or not any(k in path.name for k in keys):
+            continue
+        text = ""
+        suf = path.suffix.lower()
+        try:
+            if suf in (".txt", ".md", ".csv", ".json"):
+                text = path.read_text(encoding="utf-8", errors="ignore")
+            elif suf == ".pdf":
+                from pypdf import PdfReader
+                text = "\n".join(p.extract_text() or "" for p in PdfReader(str(path)).pages)
+            elif suf == ".docx":
+                from docx import Document
+                text = "\n".join(p.text for p in Document(str(path)).paragraphs)
+            elif suf in (".html", ".htm"):
+                text = extract_generic_page(path.read_text(errors="ignore"))[1]
+        except Exception as err:  # noqa: BLE001
+            text = ""
+            print(f"  [PIM] {path.name} nije pročitan: {err}")
+        if text.strip():
+            out.append(Source(sid="", kind=KIND_PIM, url=str(path),
+                              title=path.name, text=text[:LOCAL_SOURCE_CAP], razina=1))
+    return out
+
+
+def gather_sources(product: Product, category: str, cache_dir: Path,
+                   refresh: bool, web_search: bool, max_web: int = 3,
+                   secondary: bool = True, pim_dir: Path | None = None) -> list[Source]:
+    """Izvori po razinama iz općih pravila. S1 je uvijek eLjekarna24."""
+    sources: list[Source] = []
     if not R.je_primarni(product.url):
         return sources
     html = _cache_get_or_fetch(product.url, cache_dir, refresh)
     if html:
         text = extract_product_page(html)
         if text:
-            sources.append(Source(sid="S1", kind="stranica proizvoda",
-                                  url=product.url, title="eljekarna24", text=text))
+            sources.append(Source(sid="S1", kind=KIND_PRIMARY, url=product.url,
+                                  title="eLjekarna24", text=text, razina=2))
     if not sources:
         return sources
 
-    # --- izvor 2: webljekarna.vasezdravlje.com, pa izvor 3: stranica brenda ---
+    sources += load_local_sources(product, pim_dir, ean_sa_stranice(sources[0].text))
+
     if secondary and web_search:
-        kandidati = []
-        sek = site_search_url(product, R.SEKUNDARNA_DOMENA)
-        if sek:
-            kandidati.append((sek, SECONDARY_LABEL))
-        kandidati += [(u, TERTIARY_LABEL) for u in brand_site_urls(product)]
-        for url, oznaka in kandidati:
-            dopusteno, _razlog = R.je_dopusten(url, product.brend)
-            if not dopusteno:
+        kozmetika = category in ("B", "E", "I")
+        kandidati: list[tuple[str, str, int]] = [
+            (u, KIND_BRAND, 2) for u in brand_site_urls(product)]
+        domene = list(R.USPOREDNE_DOMENE)
+        if kozmetika:
+            domene += list(R.USPOREDNE_DOMENE_KOZMETIKA)
+        for domena in domene[:max(2, max_web + (2 if kozmetika else 0))]:
+            url = site_search_url(product, domena)
+            if url:
+                kandidati.append((url, KIND_COMPARE, 3))
+        for url, kind, razina in kandidati:
+            if not R.je_dopusten(url, product.brend, kozmetika=True)[0]:
                 continue
-            brand_html = _cache_get_or_fetch(url, cache_dir, refresh)
-            if not brand_html:
+            page = _cache_get_or_fetch(url, cache_dir, refresh)
+            if not page:
                 continue
-            title, text = extract_generic_page(brand_html)
+            title, text = extract_generic_page(page)
             if len(text) < 150:
                 continue
-            sources.append(Source(sid=f"S{len(sources) + 1}", kind=oznaka,
-                                  url=url, title=title or oznaka, text=text))
+            sources.append(Source(sid="", kind=kind, url=url,
+                                  title=title or kind, text=text, razina=razina))
             time.sleep(0.3)
 
     for i, src in enumerate(sources, start=1):
@@ -555,23 +616,30 @@ def gather_sources(product: Product, category: str, cache_dir: Path,
     return sources
 
 
+def _naziv_izvora(s: Source) -> str:
+    if s.kind == KIND_PRIMARY:
+        return "eLjekarna24"
+    if s.kind == KIND_PIM:
+        return f"Ambalaža / PIM ({s.title})"
+    host = urlparse(s.url).netloc.removeprefix("www.")
+    nazivi = {"webljekarna.vasezdravlje.com": "Vaše zdravlje",
+              "primapharme.hr": "Prima Pharme", "notino.hr": "Notino",
+              "makeup.hr": "MAKEUP", "douglas.hr": "Douglas"}
+    return nazivi.get(host, host or s.title)
+
+
 def sources_block(sources: list[Source]) -> str:
     if not sources:
-        return ("NEMA DOSTUPNIH IZVORA — koristi samo podatke iz naziva proizvoda; "
-                "za sve ostalo upotrijebi propisane placeholdere i ne izmišljaj "
-                "nikakve specifikacije.")
-    parts = []
-    for s in sources:
-        if s.kind == "stranica proizvoda":
-            head = (f"[{s.sid}] PRIORITET 1 — STRANICA PROIZVODA (eljekarna24) "
-                    f"— {s.url}")
-        elif s.kind == SECONDARY_LABEL:
-            head = (f"[{s.sid}] PRIORITET 2 — webljekarna.vasezdravlje.com "
-                    f"— {s.url}")
-        else:
-            head = f"[{s.sid}] PRIORITET 3 — SLUŽBENA STRANICA BRENDA — {s.url}"
-        parts.append(f"{head}\n{s.text}")
-    return "\n\n".join(parts)
+        return "NEMA DOSTUPNIH IZVORA."
+    opis = {
+        KIND_PIM: "RAZINA 1 — HR AMBALAŽA / DEKLARACIJA / PIM (najviša razina)",
+        KIND_PRIMARY: "RAZINA 2 — eLjekarna24, stranica proizvoda",
+        KIND_BRAND: "RAZINA 2 — službena stranica brenda / HR distributera",
+        KIND_COMPARE: ("RAZINA 3 — USPOREDNI IZVOR (samo za usporedbu podataka; "
+                       "tekst se NE kopira ni doslovno ni uz sitne izmjene)"),
+    }
+    return "\n\n".join(f"[{s.sid}] {opis.get(s.kind, s.kind)} — {_naziv_izvora(s)} — "
+                       f"{s.url}\n{s.text}" for s in sources)
 
 
 def sources_norm_text(product: Product, sources: list[Source]) -> str:
@@ -580,7 +648,7 @@ def sources_norm_text(product: Product, sources: list[Source]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Bedrock (isti .env kao bedrock-test.py)
+# Bedrock
 # ---------------------------------------------------------------------------
 
 def load_bedrock_config() -> dict:
@@ -605,12 +673,13 @@ class BedrockClient:
 
         self.model_id = config["BEDROCK_TEXT_MODEL_ID"]
         self.verify_model_id = config["BEDROCK_VERIFY_MODEL_ID"]
+        self._cache_ok = True
         self._client = boto3.client(
             "bedrock-runtime",
             region_name=config["BEDROCK_AWS_REGION"],
             aws_access_key_id=config["BEDROCK_AWS_ACCESS_KEY_ID"],
             aws_secret_access_key=config["BEDROCK_AWS_SECRET_ACCESS_KEY"],
-            config=Config(read_timeout=180, connect_timeout=10,
+            config=Config(read_timeout=600, connect_timeout=10,
                           retries={"max_attempts": 3, "mode": "standard"}),
         )
 
@@ -620,12 +689,15 @@ class BedrockClient:
 
         last_err = None
         for attempt in range(BEDROCK_RETRIES):
+            system = [{"text": system_prompt}]
+            if self._cache_ok:
+                # dugi system prompt (pravila, template, checklista) je isti za
+                # sve proizvode iste kategorije: prompt caching
+                system.append({"cachePoint": {"type": "default"}})
             try:
                 resp = self._client.converse(
-                    modelId=model_id,
-                    system=[{"text": system_prompt}],
-                    messages=[{"role": "user",
-                               "content": [{"text": user_message}]}],
+                    modelId=model_id, system=system,
+                    messages=[{"role": "user", "content": [{"text": user_message}]}],
                     inferenceConfig={"maxTokens": max_tokens,
                                      "temperature": temperature},
                 )
@@ -633,10 +705,15 @@ class BedrockClient:
                 return "".join(b.get("text", "") for b in blocks).strip()
             except ClientError as err:
                 code = err.response["Error"]["Code"]
+                msg = err.response["Error"].get("Message", "")
+                if code == "ValidationException" and self._cache_ok and \
+                        "cach" in msg.lower():
+                    self._cache_ok = False
+                    continue
                 if code in {"ThrottlingException", "ServiceUnavailableException",
-                            "InternalServerException",
-                            "ModelNotReadyException"} and attempt < BEDROCK_RETRIES - 1:
-                    time.sleep(2 ** attempt + random.uniform(0, 1))
+                            "InternalServerException", "ModelNotReadyException",
+                            "ModelErrorException"} and attempt < BEDROCK_RETRIES - 1:
+                    time.sleep(min(60, 2 ** attempt * 3) + random.uniform(0, 2))
                     last_err = err
                     continue
                 raise
@@ -651,7 +728,6 @@ class BedrockClient:
                               VERIFY_MAX_TOKENS, VERIFY_TEMPERATURE)
 
     def extract(self, system_prompt: str, user_message: str) -> str:
-        """Strukturirana ekstrakcija prije pisanja (temperatura 0)."""
         return self._converse(self.model_id, system_prompt, user_message,
                               EXTRACT_MAX_TOKENS, 0.0)
 
@@ -678,279 +754,242 @@ def explain_client_error(err, config: dict) -> str:
 # Promptovi
 # ---------------------------------------------------------------------------
 
-def build_gen_system(category: str) -> str:
-    t = T.TEMPLATES[category]
-    tabs = "\n".join(f"  Tab {i}: {label}" for i, label in enumerate(t["tabs"], 1))
-    extra = ""
-    if category == "formula":
-        extra = ("\nPOSEBNO ZA MLIJEČNE FORMULE: strogo deklarativno, bez "
-                 "idealiziranja formule; obvezna je rečenica 'Dojenje je najbolji "
-                 "način prehrane dojenčeta.' i upućivanje na tablicu hranjenja s "
-                 "deklaracije.")
-    if category == "supplement":
-        extra = ("\nPOSEBNO ZA DODATKE PREHRANI: zdravstvene tvrdnje samo u obliku "
-                 "'X doprinosi ...' i samo ako su navedene u izvorima; obvezne su "
-                 "rečenice da dodatak prehrani nije zamjena za uravnoteženu i "
-                 "raznovrsnu prehranu i da se ne prekoračuje preporučena dnevna "
-                 "doza.")
-    if category == "device":
-        extra = ("\nPOSEBNO ZA UREĐAJE: uređaj ne postavlja dijagnozu i nije "
-                 "zamjena za liječnički savjet; uputiti na (hrvatsku) uputu za "
-                 "uporabu; značajke navoditi samo potvrđene u izvorima.")
-    default = f"""Ti si stručni copywriter hrvatske internetske ljekarne "eljekarna24".
-Pišeš PDP (stranicu proizvoda) s tabovima na hrvatskom jeziku, u Markdownu,
-STROGO prema zadanom kosturu i primjeru. Kategorija proizvoda: {T.CATEGORY_LABELS[category]}.
+FORMAT_PRAVILA = """IZLAZNI FORMAT (Markdown, obavezan — po njemu sustav provjerava i
+pretvara dokument u DOCX)
+- Prvi redak: "# " + naziv proizvoda (isti kao H1).
+- Odjeljci razine 2, točno ovim nazivima i redom: "## SEO elementi",
+  "## Prvi ekran", "## Tab N: <naziv taba točno iz templatea>" za svaki tab,
+  "## Česta pitanja" (samo ako FAQ ima smisla i dopušten je).
+- SEO elementi: tablica "| Element | Tekst |" s redcima Meta title, Meta
+  description, H1, Alt tekst. Meta title završava s " │ eLjekarna24" (znak │).
+- Prvi ekran: "**Naziv proizvoda:** …" i "**Kratki opis:** …", svaki u svom retku.
+- Brza traka: jedan redak "**Brza traka:** oznaka · oznaka · oznaka" na vrhu
+  Taba 1 (kod Templatea C odmah ispod "**VAŽNA NAPOMENA:** …"). Ako nema barem
+  3 provjerena podatka, redak se izostavlja.
+- Podnaslovi unutar taba: "### …". Natuknice: "- ". Koraci: "1. ", "2. ".
+- Blok tvrdnji (gdje je dopušten): natuknice "- Sadrži …" na kraju Taba 1.
+- Tablica podataka: "| Podatak | Vrijednost |" s redcima točno iz templatea.
+- FAQ: pitanje u retku "**Pitanje?**", odgovor u sljedećem odlomku.
+- NEPROVJEREN PODATAK (u templateu „crvena boja teksta”) piši kao
+  [PROVJERITI: podatak]. Oznaka obuhvaća SAMO konkretan podatak (vrijednost,
+  naziv, broj, popis sastojaka), NIKAD cijelu rečenicu ni opisni tekst.
+  Crveno se označava:
+    * podatak koji je SAMO kod usporedne ljekarne ili webshopa (razina 3);
+    * neslaganje izvora ISTE razine (npr. eLjekarna24 i stranica brenda):
+      [PROVJERITI: vrijednost A] / [PROVJERITI: vrijednost B];
+    * obvezni podatak koji nije pronađen: ćelija prazna, naziv retka
+      [PROVJERITI: Naziv retka];
+    * podatak u koji postoji opravdana sumnja (npr. pravopisna greška u izvoru
+      prenesena doslovno, dnevna doza iznad najveće dopuštene).
+  Podatak s eLjekarne24 ili stranice brenda (razina 2) koji se ne kosi s drugim
+  izvorom razine 1–2 piše se NORMALNO, bez oznake. Ako se razina 2 i usporedni
+  izvor (razina 3) ne slažu, vrijedi razina 2, bez oznake. Opisni podatak koji
+  nije potvrđen izostavi (ne označavaj ga). Označen podatak ne ide u brzu traku.
+  Nigdje drugdje ne piši „provjeriti”, „potvrditi” ni slično.
+- Tablicu izvora NE piši: sustav je dodaje sam iz JSON-a na kraju odgovora.
+- Bez ``` ograda oko dokumenta, bez teksta prije ili poslije dokumenta.
 
-MODEL MORA
-- Koristiti priloženi INVENTAR ČINJENICA kao polazište: svaki podatak sa
-  statusom FOUND mora završiti u finalnom PDP-u, u najlogičnijem dijelu
-  strukture. Podatak označen kao HARD FIELD (doza, puni sastav/INCI, aktivne
-  tvari i koncentracije, način uporabe, upozorenja, identifikatori,
-  specifikacije) NE SMIJE nestati ni biti skraćen.
-- Prenijeti puni sastav / INCI U CIJELOSTI kada je pronađen, doslovno, bez
-  skraćivanja, prepričavanja i bez "i ostali sastojci". Popis uvedi riječju
-  "INCI:" (kozmetika), odnosno "Sastav:" (ostale kategorije). Propisani
-  placeholder koristi SAMO ako puni sastav nije pronađen.
-- Sačuvati konkretne brojke, količine, mjerne jedinice, koncentracije i
-  identifikatore točno onako kako stoje u inventaru.
-- Placeholder koristiti SAMO kada podatak stvarno nije pronađen (NOT FOUND).
-- Ako inventar sadrži KONFLIKT, vidljivo ga označiti za provjeru.
-- Stil, strukturu i objašnjenje smiješ poboljšati — činjenice ne.
+AUTOMATSKA KONTROLA (sustav ove točke provjerava doslovno; dokument koji ih
+krši vraća se na ispravak):
+- točni nazivi i redoslijed odjeljaka i tabova iz templatea, bez dodatnih tabova;
+- tablica podataka s redcima točno iz templatea, istim redom;
+- broj rečenica kratkog opisa iz templatea; prva rečenica prema zadanom obrascu,
+  ne počinje s „Ovaj proizvod”, „Riječ je o”, „Predstavljamo”, „U ponudi je”,
+  „Dolazi u obliku”; naziv proizvoda u tekstu Taba 1 najviše jednom;
+- brza traka: 3–6 kratkih oznaka odvojenih „·”, bez tvrdnji, % PU, uputa i
+  oznaka [PROVJERITI];
+- podnaslovi s podatkom o ovom proizvodu, nikad općeniti;
+- dodaci prehrani i hrana za djecu: „doprinosi” samo u bloku tvrdnji; tvrdnje
+  samo iz priloženog popisa odobrenih; bez tvrdnji o apsorpciji, iskoristivosti,
+  podnošljivosti, nadraživanju želuca ili sluznice; uz tvrdnje bez količina;
+- obvezne rečenice kategorije doslovno; SKU nigdje;
+- FAQ: na pitanje da/ne odgovor počinje s „Da” ili „Ne”; najviše 2–3 rečenice;
+- bez crtica (– —) osim u rasponu brojeva, bez uskličnika, bez navođenja izvora
+  („prema proizvođaču”, „prema deklaraciji”, „navodi se”), bez fraza i praznih
+  glagola s popisa u općim pravilima (pruža, omogućuje, osigurava, podržava, nudi);
+- svaki broj s jedinicom mora postojati u izvorima (preračunavanja poput trajanja
+  pakiranja piši bez novih jedinica);
+- tekst usporednih ljekarni se ne kopira (8 i više istih riječi zaredom).
 
-ZABRANA DEFINITIVNIH IZRAZA
-Ne koristi izraze nadmoći ni apsolutne tvrdnje ("najbolji", "najučinkovitiji",
-"najsigurniji", "jedini", "zlatni standard", "prvi izbor", "apsolutno",
-"uvijek djeluje", "svima odgovara", "bez iznimke", "bez ikakvih nuspojava",
-"trenutni rezultati") osim ako je točno takva tvrdnja doslovno potvrđena u
-izvorima uz navedenu metodu ili mjerenje. Umjesto toga navedi konkretan
-provjerljiv podatak. Iznimka su obvezne zakonske rečenice (npr. "Dojenje je
-najbolji način prehrane dojenčeta.") i mjerni izrazi ("najviše", "najmanje",
-"najkasnije").
-
-PRAVILA IZLAZA (spremno za copy/paste)
-- Iz naziva proizvoda IZBACI promotivne oznake: „2+1 GRATIS“, „akcija“,
-  „poklon“, „popust“, „specijalna ponuda“. Količina je stvarni sadržaj
-  pakiranja. Multipakiranje piši u formatu „3 × 18 tableta“.
-- AKO JE PODATAK PRONAĐEN U IZVORU, MORA BITI UPISAN, i to u svakom tabu u
-  koji spada: dnevna doza, istaknuti sastojci, puni sastav, upozorenja,
-  kliničke studije, EAN, proizvođač, pakiranje. Placeholder iz predloška
-  („Unijeti točno prema aktualnoj deklaraciji ili PIM-u.“) smije se upisati
-  SAMO kada podatak stvarno ne postoji ni u jednom izvoru. Nikada ne upućuj
-  na deklaraciju ili PIM za podatak koji imaš u inventaru.
-- U tekst za kupca NE piši oznake izvora ([S1], [S2]), riječi „KONFLIKT“,
-  „potvrditi“, „provjeriti koji je ispravan“, „Prije lokalne objave“, „prema
-  dostupnoj dokumentaciji“, nazive drugih trgovina ni njihove šifre.
-  Neslaganja i nedostatke vrati ISKLJUČIVO u završnom JSON-u.
-- Ne koristi crtice (– ili —). Umjesto njih zarez ili točka. Crtica ostaje samo
-  u rasponu brojeva (22–42 cm, 6–12 mjeseci) i unutar naziva (La Roche-Posay).
-- Šifre drugih trgovina se ne preuzimaju i ne uspoređuju; to nije konflikt.
-- Brza traka: popuni svih šest polja konkretnim podacima (Tip proizvoda,
-  Namjena, Ciljana skupina, Područje primjene, Tekstura / oblik, Pakiranje).
-  Uputa iz predloška nikad ne ostaje u izlazu.
-- Istaknuti sastojci: točno 3 ili 4, svaki s potvrđenom ulogom. Puni sastav ili
-  INCI ide doslovno ispod njih. Nutritivna tablica ide zasebno.
-- Kliničke studije: redak samo ako izvor navodi rezultat, vrijeme, broj
-  ispitanika, metodu i izvor. Inače IZOSTAVI cijeli blok.
-- Ne koristi „klinički dokazano“, „testirano“ ni „dermatološki testirano“ bez
-  objašnjenja što je i kako testirano.
-- Naziv proizvoda: Brend + naziv + glavna karakteristika + količina na kraju.
-  Bez crtice, bez znaka |, bez namjene u nazivu, bez zareza ispred količine.
-- Hrana za dojenčad: obvezna rečenica „Dojenje je najbolji način prehrane
-  dojenčeta.“ Početna hrana za dojenčad (0 do 6 mjeseci) bez prehrambenih i
-  zdravstvenih tvrdnji.
-
-PROTUPRIMJERI (ovako NE, ovako DA)
-  NE: | EAN | 3337875863377 [S1] |
-  DA: | EAN | 3337875863377 |
-  NE: KONFLIKT SKU-a: eljekarna24 navodi C001146, druga ljekarna navodi C002360.
-  DA: (ništa u dokumentu; neslaganje ide u JSON polje "konflikti")
-  NE: tip, namjena, ciljana skupina, područje, tekstura/oblik, pakiranje
-  DA: | Tip proizvoda | krema za lice |
-  NE: Avène Sun Krema SPF50 – zaštita od sunca
-  DA: Avène Sun Krema SPF50, zaštita od sunca
-  NE: | EAN | Nije pronađeno |
-  DA: | EAN | Unijeti točno prema aktualnoj deklaraciji ili PIM-u. |
-  NE: | 66 % manje mitesera | Podaci nisu navedeni u izvoru. |
-  DA: (izostavi cijeli blok Kliničke studije)
-
-KONTROLNI POPIS PRIJE PREDAJE (provjeri svaku stavku prije nego vratiš odgovor)
-  1. Nigdje u dokumentu nema [S1], [S2], riječi KONFLIKT, „potvrditi“,
-     „provjeriti koji je ispravan“, „Prije lokalne objave“, „prema dostupnoj
-     dokumentaciji“, naziva drugih trgovina ni njihovih šifri.
-  2. Nigdje nema crtica – ni —. (Provjeri svaku rečenicu. Crtica je dopuštena
-     samo između dva broja, npr. 22–42 cm.)
-  3. Brza traka ima svih šest redaka i svaki je popunjen konkretnim podatkom.
-  4. Tablica istaknutih sastojaka ima TOČNO 3 ili 4 retka podataka. Puni sastav
-     i nutritivna tablica idu ISPOD nje, odvojeni praznim retkom.
-  5. Tab 5 ima sve retke; za podatak kojeg nema u izvorima upisan je DOSLOVNO
-     tekst iz predloška, nikad „nepoznato“ ili „nije pronađeno“.
-  6. Blok Kliničke studije postoji samo ako svaki redak ima rezultat, vrijeme,
-     broj ispitanika i metodu. U suprotnom cijeli blok NE postoji.
-  7. Dokument je potpun: svi tabovi, blok recenzija i FAQ s 3 do 5 pitanja.
-  8. Naziv proizvoda: bez crtice, bez znaka |, bez namjene, količina na kraju.
-
-NA KRAJU ODGOVORA, nakon dokumenta, u zasebnom bloku vrati JSON:
+NA KRAJU ODGOVORA, nakon dokumenta, zaseban blok:
 ```json
-{{"nedostaje": ["EAN", "..."], "konflikti": ["..."], "koristeni_izvori": ["..."]}}
-```
+{"izvori": {"S1": "što taj izvor potvrđuje u opisu", "S2": "..."},
+ "nedostaje": ["obvezni podaci kojih nema ni u jednom izvoru"],
+ "konflikti": ["podatak: vrijednost A [Sx] / vrijednost B [Sy]"],
+ "provjeriti": ["svaki podatak koji si označio [PROVJERITI: …] i zašto"],
+ "kut": "kut proizvoda koji si odabrao",
+ "namjena": "namjena proizvoda za odabir tvrdnji (samo A i C)"}
+```"""
 
-MODEL NE SMIJE
-- Izbaciti pronađeni podatak zato što ga smatra manje važnim.
-- Zamijeniti postojeću vrijednost rečenicom tipa "provjeriti na pakiranju" ili
-  "provjeriti na deklaraciji".
-- Promijeniti broj, jedinicu, koncentraciju ili identifikator bez izvora.
-- Spojiti konfliktne vrijednosti iz različitih izvora u jednu novu činjenicu.
-- Opće znanje modela predstaviti kao činjenicu o ovom proizvodu.
-- Puniti PDP generičkim tekstom na štetu konkretnih podataka proizvoda.
-- Koristiti činjenice iz formatnog primjera kategorije.
 
-HIJERARHIJA IZVORA (provodi se u kodu)
-- PRIORITET 1: stranica proizvoda na eljekarna24 (URL iz ulazne tablice).
-- PRIORITET 2: webljekarna.vasezdravlje.com, za podatak kojeg nema na
-  prioritetu 1.
-- PRIORITET 3: službena hrvatska stranica brenda, za podatak kojeg nema na 1 ni 2.
-- Drugih izvora nema. Ako podatka nema ni u jednom od ta dva izvora, NE
-  izmišljaj ga: ostavi tekst iz predloška i navedi polje u listi "nedostaje".
-- Ako se konkretne vrijednosti razlikuju, NE spajaj ih i NE biraj sam:
-  neslaganje vrati isključivo u JSON polju "konflikti", nikad u tekstu.
+def _system_parts(letter: str, podvrsta: str) -> list[str]:
+    dijelovi = [
+        "OPĆA PRAVILA ZA SVE PDP OPISE (klijent, PDP template ver.11):\n\n"
+        + T.opca_pravila(),
+        f"TEMPLATE ZA OVAJ PROIZVOD ({T.label(letter)}):\n\n" + T.template_tekst(letter),
+    ]
+    for naziv, tekst in T.checkliste_za(letter, podvrsta):
+        dijelovi.append(f"{naziv.upper()} (ima prednost pred templateom ako se "
+                        f"razlikuju):\n\n{tekst}")
+    return dijelovi
 
-PRAVILA SADRŽAJA (apsolutna)
-1. ISKLJUČIVO ČINJENICE IZ IZVORA [S1..Sn], iz INVENTARA ili iz naziva
-   proizvoda. Ništa se ne izmišlja: ni sastojci, ni brojke, ni tvrdnje, ni EAN,
-   ni proizvođač.
-2. Svaki broj s jedinicom (ml, g, mg, µg, IU, kapsula, cm, %...) smije se
-   upotrijebiti samo ako postoji u izvorima ili nazivu.
-3. Podatak kojeg nema u izvorima: upotrijebi točan placeholder
-   "{T.PLACEHOLDER_UNKNOWN}" (Proizvođač, EAN i sl.), odnosno
-   "{T.PLACEHOLDER_ORIGIN}" (Zemlja podrijetla), ili ga izostavi.
-4. Oprezan, provjerljiv jezik s ogradama: "prema deklaraciji", "prema podacima
-   proizvoda", "prema uputi". Bez obećanja rezultata.
-5. ZABRANJENO: cijene i valute, akcije/popusti/gratis, dostava, dostupnost,
-   zalihe, košarica, pozivi na akciju (naruči, kupi, kliknite, saznajte...),
-   superlativi (najbolji, vrhunski, savršen...), "klinički dokazano" bez metode,
-   liječi/izliječi/jamči/garantira, spominjanje konkurenata i drugih trgovina.
-6. Kliničke brojke samo ako u izvorima postoje s metodom (vrijeme, broj
-   ispitanika, način mjerenja); inače se sekcija Kliničke studije izostavlja.
-7. FAQ: 3–5 stvarnih pitanja kupaca, odgovori isključivo iz izvora.{extra}
 
-PRAVILA FORMATA (apsolutna)
-1. Odgovor je ISKLJUČIVO Markdown dokument, bez ikakvog teksta prije ili
-   poslije, bez ``` ograda.
-2. Kostur, redoslijed sekcija, numeracija i naslovi moraju biti TOČNO kao u
-   zadanom kosturu; primjer pokazuje gotov dokument iste kategorije.
-3. Nazivi tabova moraju biti doslovno:
-{tabs}
-4. "Brza traka ispod opisa" sadrži točno ovu liniju polja: "{t['brza_traka']}"
-   i nakon nje 3–4 natuknice ključnih prednosti.
-5. Tab 1 ima 80 do 150 riječi, ciljaj 110 do 130 riječi da se izbjegne granični promašaj. Počinje situacijom kupca.
-6. Tab 5 obvezno sadrži tablicu s redcima: Pakiranje, Brend, Proizvođač,
-   Zemlja podrijetla, EAN i "Obvezna provjera prije objave", plus upozorenja
-   iz deklaracije kao zasebne rečenice.
-7. Tab 6 i blok "Ocjene i recenzije kupaca" prepisuju se DOSLOVNO iz kostura.
-8. Primjer služi ISKLJUČIVO za format: nijedna činjenica iz primjera ne smije
-   završiti u tvom dokumentu ako ne postoji i u izvorima za OVAJ proizvod."""
-    prompt = prompts_cfg.render(
-        "pdp_system", default,
-        kategorija=T.CATEGORY_LABELS[category],
-        tabovi=tabs,
-        brza_traka=t["brza_traka"],
-        extra=extra.strip(),
-        PLACEHOLDER_UNKNOWN=T.PLACEHOLDER_UNKNOWN,
-        PLACEHOLDER_ORIGIN=T.PLACEHOLDER_ORIGIN,
+def build_gen_system(letter: str, podvrsta: str = "") -> str:
+    podvrsta = podvrsta or T.podvrsta_heuristika(letter)
+    default = (
+        "Ti si iskusna magistra farmacije i copywriterica hrvatske internetske "
+        "ljekarne eLjekarna24. Pišeš PDP opis proizvoda na hrvatskom jeziku, "
+        "točno prema klijentovim pravilima, templateu i checklisti niže. "
+        "Pravila su obvezna; checklista ima prednost pred templateom.\n\n"
+        "Postupak prije pisanja (ne upisuje se u dokument): provjeri je li svaki "
+        "izvor isti proizvod i pakiranje; odredi kut proizvoda; odaberi "
+        "relevantne odobrene tvrdnje iz priloženog popisa; prođi završnu "
+        "provjeru iz checkliste prije predaje.\n\n"
+        + FORMAT_PRAVILA + "\n\n" + "\n\n".join(_system_parts(letter, podvrsta))
     )
-    return prompts_cfg.with_notes(prompt, "pdp_napomene",
-                                  f"pdp_napomene_{category}")
+    prompt = prompts_cfg.render("pdp_system", default, kategorija=T.label(letter))
+    return prompts_cfg.with_notes(prompt, "pdp_napomene", f"pdp_napomene_{letter}")
 
 
-def build_gen_user(product: Product, category: str, sources: list[Source],
-                   feedback: str | None = None, inventory=None) -> str:
-    inv_block = ""
+@dataclass
+class Upute:
+    """Izračuni iz koda koji idu piscu i kontroli."""
+    obrazac: str = ""
+    obrazac_opis: str = ""
+    regulativa: str = ""
+    prilog_ii: str = ""
+    zauzeti_poceci: list = field(default_factory=list)
+    dodatno: list = field(default_factory=list)
+
+
+def build_gen_user(product: Product, letter: str, podvrsta: str,
+                   sources: list[Source], feedback: str | None = None,
+                   inventory=None, upute: Upute | None = None) -> str:
+    upute = upute or Upute()
+    primjer = T.primjer_za(letter)
+    primjer_blok = (f"\n\nODOBRENI PRIMJER GOTOVOG OPISA (drugi proizvod; samo za "
+                    f"format, ton i razinu detalja — nijedna činjenica iz primjera "
+                    f"ne ide u ovaj opis):\n<<<PRIMJER\n{primjer}PRIMJER>>>"
+                    if primjer else "")
+    inv_blok = ""
     if inventory is not None and inventory.facts:
-        inv_block = f"""
+        inv_blok = ("\n\nINVENTAR ČINJENICA (izvučen iz izvora prije pisanja; "
+                    "OBVEZNO PRENIJETI = mora biti u opisu):\n<<<INVENTAR\n"
+                    + inventory.as_prompt_block() + "\nINVENTAR>>>")
+    tabovi = "\n".join(f"  Tab {n}: {t}" + (" (neobvezan)" if o else "")
+                       for n, t, o in T.tabs_for(letter, podvrsta))
+    smjernice = [
+        f"Template: {T.label(letter)}; podvrsta: {podvrsta or '-'}.",
+        f"Tabovi (točni nazivi):\n{tabovi}",
+        f"Obrazac prve rečenice kratkog opisa ({upute.obrazac}): prva rečenica "
+        f"počinje {upute.obrazac_opis}.",
+        "FAQ: " + ("dopušten, neobvezan, najviše "
+                   f"{T.TEMPLATE_META[letter]['faq_max']} pitanja."
+                   if T.faq_dopusten(letter, podvrsta) else "NE stavlja se."),
+        f"Datum pristupa izvorima: {danas_hr()}",
+    ]
+    if upute.zauzeti_poceci:
+        smjernice.append("KONTROLA SERIJE: ovi su počeci prve rečenice već iskorišteni "
+                         "u opisima iste kategorije; tvoja prva rečenica NE smije "
+                         "počinjati istim riječima: "
+                         + "; ".join(f"„{p}…”" for p in upute.zauzeti_poceci[-25:]))
+    smjernice += upute.dodatno
+    reg = ""
+    if upute.regulativa:
+        reg = f"\n\nREGULATIVA (izračunao sustav):\n{upute.regulativa}"
+    if upute.prilog_ii:
+        reg += ("\n\nIZVADAK IZ PRILOGA II. PRAVILNIKA NN 160/2013 za sastojke "
+                f"proizvoda (najveće doze i posebna upozorenja):\n{upute.prilog_ii}")
 
-INVENTAR ČINJENICA (strukturirano izvučen iz izvora PRIJE pisanja — sve što je
-FOUND mora završiti u PDP-u; HARD FIELD se ne smije izgubiti ni skratiti):
-<<<INVENTAR
-{inventory.as_prompt_block()}
-INVENTAR>>>"""
     msg = f"""PROIZVOD
-Naziv (iz baze; normaliziraj velika slova): {product.naziv}
+Naziv u bazi (normaliziraj velika slova; promotivne oznake poput „2+1 GRATIS” ne
+idu u naziv): {product.naziv}
 Brend: {product.brend or "-"}
-Sekcija: {product.sekcija or "-"}
-SKU: {product.sku}
+Sekcija webshopa: {product.sekcija or "-"}
 URL: {product.url}
 
-KOSTUR (obavezan format):
-<<<KOSTUR
-{T.build_skeleton(category)}
-KOSTUR>>>
+SMJERNICE ZA OVAJ PROIZVOD
+- {chr(10).join('- ' + s for s in smjernice)[2:]}
 
-PRIMJER GOTOVOG DOKUMENTA ISTE KATEGORIJE (drugi proizvod; SAMO za format):
-<<<PRIMJER
-{T.EXAMPLES[category]}
-PRIMJER>>>
+KOSTUR IZLAZNOG FORMATA:
+<<<KOSTUR
+{T.build_skeleton(letter, podvrsta)}KOSTUR>>>{primjer_blok}
 
 IZVORI ZA OVAJ PROIZVOD:
 <<<IZVORI
 {sources_block(sources)}
-IZVORI>>>{inv_block}
+IZVORI>>>{inv_blok}{reg}
 
-Napiši potpuni PDP dokument za ovaj proizvod. Vrati samo Markdown."""
+Napiši potpuni PDP opis za ovaj proizvod u izlaznom formatu, zatim JSON blok."""
     if feedback:
         msg += f"""
 
 PRETHODNI POKUŠAJ NIJE PROŠAO KONTROLU. Ispravi SVE navedeno i vrati cijeli
-ispravljeni dokument:
+ispravljeni dokument (i JSON blok); dijelove koji nisu navedeni ne mijenjaj
+bez potrebe:
 {feedback}"""
     return msg
 
 
-VERIFY_SYSTEM_DEFAULT = """Ti si stroga kontrola činjenica za sadržaj internetske ljekarne.
-Dobit ćeš IZVORE [S1..Sn] i PDP dokument. Provjeri svaku ČINJENIČNU tvrdnju o
-proizvodu (sastojci, brojke, doze, namjena, dobne granice, sadržaj pakiranja,
-tehnologije, EAN, proizvođač, rezultati ispitivanja): je li potkrijepljena
-izvorima ili nazivom proizvoda?
+VERIFY_SYSTEM_DEFAULT = """Ti si stručna provjera PDP opisa za eLjekarna24: magistra farmacije
+sa znanjem regulative hrane, dodataka prehrani, kozmetike i medicinskih
+proizvoda u RH/EU. Dobit ćeš IZVORE, regulatorne izračune sustava, pravila
+(opća pravila, template i checklistu) i gotov PDP opis.
 
-NE prijavljuj:
-- opće upute sigurnog korištenja i standardna upozorenja kategorije;
-- placeholder rečenice ("Unijeti točno prema aktualnoj deklaraciji ili PIM-u.",
-  "Navesti samo ako je potvrđena...") i fiksne blokove (Tab 6, recenzije);
-- formulacije s ogradom koje ne unose novu činjenicu;
-- OČITE IZVEDENICE iz naziva i tipa proizvoda. Ako je proizvod krema za lice,
-  onda „područje primjene: lice“, „tip proizvoda: krema“ i „ciljana skupina:
-  odrasli“ NISU tvrdnje koje treba prijaviti. Isto vrijedi za polja brze trake
-  koja logično slijede iz naziva, oblika ili pakiranja;
-- preoblikovane opise svojstava koji prenose isto značenje kao izvor drugim
-  riječima (npr. izvor kaže „lagana tekstura koja se brzo upija“, tekst kaže
-  „baršunasta tekstura koja se brzo upija“) ako nema nove činjenice;
-- prijevod sadržaja s izvora na hrvatski.
+Provjeri i prijavi SAMO stvarne greške:
+1. ČINJENICE: svaki podatak o proizvodu (sastojci, količine, doze, dob, upute,
+   upozorenja, EAN, proizvođač, specifikacije, okus, oblik) mora biti u izvorima.
+   Podatak koji je samo u jednom izvoru ili samo kod usporedne ljekarne mora biti
+   označen [PROVJERITI: …]. Izmišljen ili promijenjen podatak je greška.
+2. REGULATIVA: zdravstvene tvrdnje samo iz popisa odobrenih tvrdnji koje je
+   izračunao sustav (uvjet ispunjen) i samo relevantne za namjenu; nikakvi
+   drugi učinci (ni u podnaslovima, brzoj traci, FAQ-u, SEO-u); obvezne
+   napomene kategorije doslovno i na pravom mjestu; za početnu formulu bez
+   ikakvih tvrdnji, bez FAQ-a i bez isticanja pojedinih sastojaka; kozmetika
+   samo učinci koje navodi brend, bez liječenja; medicinski proizvod samo
+   namjena iz upute; „bio/eko” samo uz certifikat.
+3. PRAVILA PISANJA: navođenje izvora u javnom tekstu („prema proizvođaču”…),
+   šablonski uvodi, prazni glagoli, zabranjene fraze, ponavljanje istog podatka
+   u više tabova, odgovor u FAQ-u bez jednoznačnog podatka, kopiran tekst
+   usporedne ljekarne, prva rečenica kratkog opisa koja ne slijedi zadani
+   obrazac ili ne prolazi test različitosti.
 
-PRIJAVLJUJ samo tvrdnje koje unose NOVU činjenicu koje nema u izvorima:
-izmišljene sastojke, brojke, doze, dobne granice, tehnologije, rezultate
-ispitivanja, identifikatore i tvrdnje o učinku kojih nema u izvoru.
+NE prijavljuj: stil koji je u skladu s pravilima, očite izvedenice iz naziva i
+oblika proizvoda (npr. „krema za lice” → područje primjene lice), prijevod
+podatka s izvora na hrvatski, oznake [PROVJERITI: …] same po sebi, % PU koji je
+izračunao sustav.
 
-Odgovori ISKLJUČIVO validnim JSON-om, bez ikakvog drugog teksta:
+Odgovori ISKLJUČIVO validnim JSON-om:
 {"prolazi": true/false,
- "nepotkrijepljene_tvrdnje": [{"tvrdnja": "...", "razlog": "..."}],
- "napomena": "..."}
-"prolazi" je false čim postoji ijedna nepotkrijepljena činjenična tvrdnja."""
+ "greske": [{"mjesto": "Tab 1 / Kratki opis / …", "problem": "…",
+             "ispravak": "kako ispraviti", "vrsta": "činjenica|regulativa|pisanje"}],
+ "napomena": "…"}
+"prolazi" je false čim postoji ijedna greška vrste činjenica ili regulativa,
+ili više od dvije greške vrste pisanje."""
 
 
-def build_verify_system() -> str:
+def build_verify_system(letter: str = "A", podvrsta: str = "") -> str:
+    default = VERIFY_SYSTEM_DEFAULT + "\n\nPRAVILA KLIJENTA:\n\n" + \
+        "\n\n".join(_system_parts(letter, podvrsta or T.podvrsta_heuristika(letter)))
     return prompts_cfg.with_notes(
-        prompts_cfg.render("verify_system", VERIFY_SYSTEM_DEFAULT),
-        "verify_napomene")
+        prompts_cfg.render("verify_system", default), "verify_napomene")
 
 
-def build_verify_user(product: Product, sources: list[Source], md: str) -> str:
-    return f"""PROIZVOD: {product.naziv} (brend: {product.brend}, SKU: {product.sku})
+def build_verify_user(product: Product, sources: list[Source], md: str,
+                      upute: Upute | None = None) -> str:
+    upute = upute or Upute()
+    return f"""PROIZVOD: {product.naziv} (brend: {product.brend})
 
 IZVORI:
 <<<IZVORI
 {sources_block(sources)}
 IZVORI>>>
 
-PDP DOKUMENT ZA PROVJERU:
+REGULATORNI IZRAČUNI SUSTAVA:
+{upute.regulativa or "(nema)"}
+Zadani obrazac prve rečenice: {upute.obrazac_opis or "-"}
+
+PDP OPIS ZA PROVJERU:
 <<<PDP
 {md}
 PDP>>>
@@ -959,36 +998,34 @@ Vrati samo JSON."""
 
 
 def parse_verifier_json(text: str) -> dict | None:
-    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.S)
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", (text or "").strip(), flags=re.S)
     for chunk in (cleaned, *re.findall(r"\{.*\}", cleaned, flags=re.S)):
         try:
             data = json.loads(chunk)
         except (json.JSONDecodeError, TypeError):
             continue
         if isinstance(data, dict) and "prolazi" in data:
-            claims = data.get("nepotkrijepljene_tvrdnje") or []
-            if not isinstance(claims, list):
-                claims = []
-            data["nepotkrijepljene_tvrdnje"] = [
-                c for c in claims if isinstance(c, dict) and c.get("tvrdnja")
-            ]
+            greske = data.get("greske")
+            if greske is None:   # stari format
+                greske = [{"problem": c.get("tvrdnja", ""), "ispravak": c.get("razlog", ""),
+                           "vrsta": "činjenica"}
+                          for c in data.get("nepotkrijepljene_tvrdnje") or []
+                          if isinstance(c, dict)]
+            data["greske"] = [g for g in greske if isinstance(g, dict) and g.get("problem")]
             return data
     return None
 
 
 # ---------------------------------------------------------------------------
-# Parsiranje Markdowna i validacija strukture
+# Obrada odgovora
 # ---------------------------------------------------------------------------
 
 HEADING_RE = re.compile(r"^(#{1,3})\s+(.*?)\s*$")
-
-
 JSON_BLOK_RE = re.compile(r"```json\s*(\{.*?\})\s*```\s*$", re.S)
 
 
 def odvoji_json_blok(raw: str) -> tuple[str, dict]:
-    """Izdvoji završni JSON (nedostaje / konflikti / koristeni_izvori) iz odgovora.
-    Dokument koji ide klijentu ostaje bez njega."""
+    """Izdvoji završni JSON iz odgovora; dokument ostaje bez njega."""
     m = JSON_BLOK_RE.search(raw or "")
     podaci: dict = {}
     if m:
@@ -1000,8 +1037,7 @@ def odvoji_json_blok(raw: str) -> tuple[str, dict]:
             podaci = {}
         raw = raw[:m.start()].rstrip()
     else:
-        # model je vratio goli JSON na kraju, bez ograda
-        m2 = re.search(r"\n(\{\s*\"(?:nedostaje|konflikti|koristeni_izvori)\".*\})\s*$",
+        m2 = re.search(r"\n(\{\s*\"(?:izvori|nedostaje|konflikti|provjeriti)\".*\})\s*$",
                        raw or "", re.S)
         if m2:
             try:
@@ -1012,41 +1048,45 @@ def odvoji_json_blok(raw: str) -> tuple[str, dict]:
     return raw, podaci
 
 
-def upisi_ean(md: str, inventory) -> tuple[str, bool]:
-    """Ako je EAN potvrđen u izvorima, a u Tabu 5 je ostao placeholder,
-    upiši ga. Deterministički, bez novog poziva modelu."""
-    if inventory is None:
-        return md, False
-    ean = ""
-    for fact in inventory.found():
-        if fact.polje == "identifikatori":
-            znamenke = re.findall(r"\b\d{8,14}\b", fact.vrijednost or "")
-            if znamenke:
-                ean = znamenke[0]
-                break
+def clean_markdown(raw: str) -> str:
+    text = re.sub(r"^```(?:markdown|md)?\s*|\s*```$", "", (raw or "").strip(), flags=re.S)
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("# "):
+            text = "\n".join(lines[i:])
+            break
+    # model ponekad sam doda tablicu izvora: nju piše sustav
+    text = re.split(r"\n## Izvori\b", text)[0]
+    return text.strip() + "\n"
+
+
+def upisi_ean(md: str, ean: str) -> tuple[str, bool]:
+    """Potvrđen EAN upiši u prazan redak EAN tablice podataka."""
     if not ean or ean in md:
         return md, False
-    novi = []
-    upisano = False
+    novi, upisano = [], False
     for redak in md.splitlines():
         if (not upisano and redak.strip().startswith("|")
-                and re.search(r"\|\s*EAN[^|]*\|", redak, re.IGNORECASE)):
+                and re.match(r"\|\s*(\[PROVJERITI:\s*)?EAN\]?\s*\|", redak.strip())):
             celije = redak.strip().strip("|").split("|")
             if len(celije) >= 2 and not re.search(r"\d{8,14}", celije[1]):
-                celije[1] = f" {ean} "
-                redak = "|" + "|".join(celije) + "|"
+                redak = f"| EAN | {ean} |"
                 upisano = True
         novi.append(redak)
     return "\n".join(novi), upisano
 
 
-def clean_markdown(raw: str) -> str:
-    text = re.sub(r"^```(?:markdown|md)?\s*|\s*```$", "", raw.strip(), flags=re.S)
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        if line.startswith("# "):
-            return "\n".join(lines[i:]).strip() + "\n"
-    return text.strip() + "\n"
+def dodaj_tablicu_izvora(md: str, sources: list[Source], potvrde: dict) -> str:
+    redovi = ["", "## Izvori (ne objavljuje se)", "",
+              "| ID | Naziv i URL | Datum pristupa | Što potvrđuje |",
+              "| --- | --- | --- | --- |"]
+    for s in sources:
+        sto = str(potvrde.get(s.sid) or potvrde.get(f"[{s.sid}]") or "").strip()
+        if not sto and s.usporedni:
+            sto = "usporedba podataka"
+        sto = sto.replace("|", "/") or "-"
+        redovi.append(f"| {s.sid} | {_naziv_izvora(s)}, {s.url} | {s.datum} | {sto} |")
+    return md.rstrip() + "\n" + "\n".join(redovi) + "\n"
 
 
 def parse_headings(md: str) -> list[dict]:
@@ -1054,375 +1094,381 @@ def parse_headings(md: str) -> list[dict]:
     for idx, line in enumerate(md.splitlines()):
         m = HEADING_RE.match(line)
         if m:
-            out.append({"level": len(m.group(1)), "title": m.group(2),
-                        "line": idx})
+            out.append({"level": len(m.group(1)), "title": m.group(2), "line": idx})
     return out
 
 
-def block_of(md: str, headings: list[dict], pos: int) -> str:
-    """Tekst nakon headinga `pos` do sljedećeg headinga iste ili više razine."""
+def sekcije(md: str) -> dict[str, str]:
+    """Odjeljci razine 2: naslov -> tekst do sljedećeg naslova razine ≤ 2."""
     lines = md.splitlines()
-    start = headings[pos]["line"] + 1
-    level = headings[pos]["level"]
-    end = len(lines)
-    for h in headings[pos + 1:]:
-        if h["level"] <= level:
-            end = h["line"]
-            break
-    return "\n".join(lines[start:end])
-
-
-def prose_words(block: str) -> int:
-    words = 0
-    for line in block.splitlines():
-        s = line.strip()
-        if not s or s.startswith(("|", "#", "-", "*")):
+    heads = [h for h in parse_headings(md) if h["level"] <= 2]
+    out = {}
+    for i, h in enumerate(heads):
+        if h["level"] != 2:
             continue
-        words += len(s.split())
-    return words
+        end = heads[i + 1]["line"] if i + 1 < len(heads) else len(lines)
+        out[h["title"]] = "\n".join(lines[h["line"] + 1:end])
+    return out
 
 
-def has_table(block: str) -> bool:
-    lines = [ln.strip() for ln in block.splitlines()]
-    return any(ln.startswith("|") and "---" in ln for ln in lines)
+def tablica(block: str) -> list[list[str]]:
+    rows = []
+    for ln in block.splitlines():
+        s = ln.strip()
+        if not s.startswith("|"):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if all(re.fullmatch(r":?-{3,}:?", c) for c in cells if c):
+            continue
+        rows.append(cells)
+    return rows
 
 
-def validate_pdp(md: str, product: Product, category: str,
-                 sources: list[Source]) -> list[str]:
-    """Deterministička kontrola formata i sadržajnih pravila. [] = prolaz."""
-    t = T.TEMPLATES[category]
+def recenice(tekst: str) -> list[str]:
+    t = re.sub(r"\s+", " ", (tekst or "").strip())
+    if not t:
+        return []
+    # ne dijeli na brojevima („1. vrećica”, „2,5 µg”) ni kraticama
+    dijelovi = re.split(r"(?<=[a-zčćžšđ0-9%)”\]])[.!?]\s+(?=[A-ZČĆŽŠĐ„\"])", t)
+    return [d.strip() for d in dijelovi if d.strip()]
+
+
+def kratki_opis(md: str) -> str:
+    m = re.search(r"\*\*Kratki opis:\*\*\s*(.+)", md)
+    return m.group(1).strip() if m else ""
+
+
+def naziv_iz_md(md: str) -> str:
+    m = re.search(r"\*\*Naziv proizvoda:\*\*\s*(.+)", md)
+    if m:
+        return m.group(1).strip()
+    m = re.match(r"#\s+(.+)", md.strip())
+    return m.group(1).strip() if m else ""
+
+
+def pocetak(recenica: str, n: int = 4) -> str:
+    return " ".join(re.sub(r"\[PROVJERITI:\s*|\]", "", recenica).split()[:n])
+
+
+def oznake_za_provjeru(md: str) -> list[str]:
+    return [m.group(1).strip() or "(bez teksta)"
+            for m in re.finditer(r"\[PROVJERITI(?::\s*([^\]]*))?\]", md)]
+
+
+# ---------------------------------------------------------------------------
+# Deterministička kontrola
+# ---------------------------------------------------------------------------
+
+# Checklista dodaci prehrani, pogl. 5: „Ne smije se napisati što taj oblik radi
+# u tijelu: bolja apsorpcija ili iskoristivost, blaže za želudac, ne iritira
+# sluznicu, bolje se podnosi, bez nuspojava.”
+UCINAK_OBLIKA_RE = re.compile(
+    r"\b(apsorpcij\w*|apsorbira\w*|iskoristiv\w*|bioraspoloživ\w*|podnošljiv\w*|"
+    r"bolje se podnosi|nadražuj\w*|ne iritira\w*|iritacij\w* (želuca|sluznice)|"
+    r"blaž\w* za želud\w*|osjetljiv\w* želu\w*|nježn\w* (za|prema) želu\w*|"
+    r"bez (probavnih )?nuspojava|bez zatvora)\b", re.IGNORECASE)
+
+YES_NO_RE = re.compile(r"^(je li|jesu li|smije li|smiju li|može li|mogu li|sadrži li|"
+                       r"ima li|treba li|trebam li|smijem li|koristi li|odgovara li)\b",
+                       re.IGNORECASE)
+
+
+def validate_pdp(md: str, product: Product, letter: str, podvrsta: str,
+                 sources: list[Source], inventory=None,
+                 procjena: G.Procjena | None = None, upute: Upute | None = None,
+                 meta_inv: dict | None = None) -> list[str]:
+    """Deterministička kontrola. [] = prolaz."""
+    upute = upute or Upute()
+    meta = T.TEMPLATE_META[letter]
     errors: list[str] = []
-    headings = parse_headings(md)
+    sek = sekcije(md)
+    naslovi = list(sek)
 
-    h1 = [h for h in headings if h["level"] == 1]
-    if len(h1) != 1 or not h1[0]["title"].startswith("PDP struktura s tabovima:"):
-        errors.append("Dokument mora početi s točno jednim naslovom "
-                      "'# PDP struktura s tabovima: <naziv>'.")
+    # --- H1 i redoslijed odjeljaka ---
+    h1 = [h for h in parse_headings(md) if h["level"] == 1]
+    if len(h1) != 1:
+        errors.append("Dokument mora početi s točno jednim naslovom '# <naziv proizvoda>'.")
+    ocekivani = ["SEO elementi", "Prvi ekran"] + \
+        [f"Tab {n}: {t}" for n, t, _ in T.tabs_for(letter, podvrsta)]
+    neobvezni = {f"Tab {n}: {t}" for n, t, o in T.tabs_for(letter, podvrsta) if o}
+    dopusteni = set(ocekivani) | {"Česta pitanja"}
+    for nas in naslovi:
+        if nas not in dopusteni:
+            errors.append(f"Odjeljak '## {nas}' nije u templateu. Dopušteni su: "
+                          + ", ".join(ocekivani) + " i 'Česta pitanja'.")
+    prisutni = [n for n in ocekivani if n in sek]
+    for n in ocekivani:
+        if n not in sek and n not in neobvezni:
+            errors.append(f"Nedostaje odjeljak '## {n}' (naziv točno iz templatea).")
+    if [n for n in naslovi if n in ocekivani] != prisutni:
+        errors.append("Odjeljci nisu redoslijedom iz templatea.")
+    if sum(1 for n in naslovi if n.startswith("Tab ")) > 6:
+        errors.append("Najviše 6 tabova.")
 
-    # --- H2 sekcije redom, s točnom numeracijom ---
-    h2 = [h for h in headings if h["level"] == 2]
-    h2_titles = [h["title"] for h in h2]
-
-    def h2_index(prefix: str) -> int:
-        for i, title in enumerate(h2_titles):
-            if title.startswith(prefix):
-                return i
-        return -1
-
-    expected_fixed = ["1. Prvi ekran: Naziv, opis i brzi podatci",
-                      "2. Istaknuti blok iznad tabova",
-                      "3. Struktura tabova (Max 6 tabova)"]
-    for i, expected in enumerate(expected_fixed):
-        if i >= len(h2_titles) or h2_titles[i] != expected:
-            got = h2_titles[i] if i < len(h2_titles) else "(nedostaje)"
-            errors.append(f"Sekcija {i + 1} mora biti točno '## {expected}' "
-                          f"(nađeno: '{got}').")
-
-    studies_idx = h2_index("4. Kliničke studije")
-    has_studies = studies_idx != -1
-    if has_studies and not t["allow_studies"]:
-        errors.append("Sekcija 'Kliničke studije' nije dopuštena za ovu "
-                      "kategoriju — izostavi je.")
-    n_reviews = 5 if has_studies else 4
-    reviews_expected = f"{n_reviews}. Ocjene i recenzije kupaca"
-    faq_expected = f"{n_reviews + 1}. Često postavljana pitanja (FAQ)"
-    if reviews_expected not in h2_titles:
-        errors.append(f"Nedostaje ili je pogrešno numerirana sekcija "
-                      f"'## {reviews_expected}'.")
-    if faq_expected not in h2_titles:
-        errors.append(f"Nedostaje ili je pogrešno numerirana sekcija "
-                      f"'## {faq_expected}'.")
-
-    # --- Sekcija 1: naziv, kratki opis, brza traka ---
-    sec1_pos = next((i for i, h in enumerate(headings)
-                     if h["level"] == 2 and h["title"].startswith("1. Prvi ekran")),
-                    None)
-    if sec1_pos is not None:
-        sec1_end = next((h["line"] for h in headings[sec1_pos + 1:]
-                         if h["level"] <= 2), len(md.splitlines()))
-        sub = [h for h in headings
-               if h["level"] == 3 and headings[sec1_pos]["line"] < h["line"] < sec1_end]
-        sub_titles = [h["title"] for h in sub]
-        for expected in ["Naziv proizvoda", "Kratki opis", "Brza traka ispod opisa"]:
-            if expected not in sub_titles:
-                errors.append(f"U sekciji 1 nedostaje podnaslov '### {expected}'.")
-
-        for i, h in enumerate(sub):
-            if h["title"] == "Naziv proizvoda":
-                body = block_of(md, headings, headings.index(h))
-                name_line = next((ln.strip() for ln in body.splitlines()
-                                  if ln.strip()), "")
-                if not name_line:
-                    errors.append("Naziv proizvoda je prazan.")
-                else:
-                    brand_tok = norm_compact(product.brend)
-                    first_tok = (norm_spaced(product.naziv).split() or [""])[0]
-                    nn = norm_compact(name_line)
-                    if brand_tok and not nn.startswith(brand_tok) \
-                            and not nn.startswith(norm_compact(first_tok)):
-                        errors.append("Naziv proizvoda mora početi brendom "
-                                      f"('{product.brend}').")
-                    src_specs = spec_tokens(product.naziv)
-                    if src_specs and not (spec_tokens(name_line) & src_specs):
-                        errors.append("Naziv proizvoda mora sadržavati količinu iz "
-                                      f"naziva u bazi (npr. {sorted(src_specs)[0]}).")
-            if h["title"] == "Kratki opis":
-                body = block_of(md, headings, headings.index(h)).strip()
-                if not body:
-                    errors.append("Kratki opis je prazan.")
-                else:
-                    # rečenicom se smatra točka iza koje slijedi veliko slovo
-                    recenice = len(re.findall(r"[.!?]\s+[A-ZČĆŽŠĐ]", body)) + 1
-                    if recenice > 1:
-                        errors.append("Kratki opis mora biti jedna rečenica.")
-            if h["title"] == "Brza traka ispod opisa":
-                body = block_of(md, headings, headings.index(h))
-                lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
-                bullets = [ln for ln in lines if ln.startswith("- ")]
-                if not 3 <= len(bullets) <= 4:
-                    errors.append("Brza traka mora imati 3–4 natuknice ključnih "
-                                  f"prednosti (nađeno: {len(bullets)}).")
-
-    # --- Sekcija 2: istaknuti blok ---
-    sec2_pos = next((i for i, h in enumerate(headings)
-                     if h["level"] == 2 and
-                     h["title"].startswith("2. Istaknuti blok")), None)
-    if sec2_pos is not None:
-        body = block_of(md, headings, sec2_pos)
-        if not has_table(body):
-            errors.append("Istaknuti blok iznad tabova mora sadržavati tablicu.")
-
-    # --- Tabovi ---
-    tab_heads = [h for h in headings
-                 if h["level"] == 3 and h["title"].startswith("Tab ")]
-    if len(tab_heads) != 6:
-        errors.append(f"Mora postojati točno 6 tabova (nađeno: {len(tab_heads)}).")
-    for i, expected_label in enumerate(t["tabs"], start=1):
-        expected = f"Tab {i}: {expected_label}"
-        found = next((h for h in tab_heads if h["title"] == expected), None)
-        if not found:
-            got = tab_heads[i - 1]["title"] if i - 1 < len(tab_heads) else "(nedostaje)"
-            errors.append(f"Tab {i} mora se zvati točno '### {expected}' "
-                          f"(nađeno: '{got}').")
-
-    tab_blocks: dict[int, str] = {}
-    for h in tab_heads:
-        m = re.match(r"Tab (\d)", h["title"])
+    # --- SEO elementi ---
+    seo = {r[0].lower(): (r[1] if len(r) > 1 else "")
+           for r in tablica(sek.get("SEO elementi", ""))}
+    for kljuc in ("meta title", "meta description", "h1", "alt tekst"):
+        if not seo.get(kljuc, "").strip():
+            errors.append(f"SEO elementi: nedostaje redak '{kljuc}'.")
+    title = seo.get("meta title", "")
+    if title and not title.rstrip().endswith("│ eLjekarna24"):
+        errors.append("Meta title mora završavati s ' │ eLjekarna24' (znak │).")
+    desc = seo.get("meta description", "")
+    if len(desc) > 165:
+        errors.append(f"Meta description ima {len(desc)} znakova (najviše ~155).")
+    if h1 and seo.get("h1") and norm_compact(seo["h1"]) != norm_compact(h1[0]["title"]):
+        errors.append("H1 u SEO elementima mora biti jednak naslovu dokumenta.")
+    for k in ("meta title", "meta description", "h1"):
+        m = SLOGAN_RE.search(norm_spaced(seo.get(k, "")))
         if m:
-            tab_blocks[int(m.group(1))] = block_of(md, headings, headings.index(h))
+            errors.append(f"{k}: skraćeni zdravstveni slogan '{m.group(0)}' nije dopušten.")
 
-    if 1 in tab_blocks:
-        n_words = prose_words(tab_blocks[1])
-        if not TAB1_MIN_WORDS <= n_words <= TAB1_MAX_WORDS:
-            errors.append(f"Tab 1 mora imati {TAB1_MIN_WORDS}–{TAB1_MAX_WORDS} "
-                          f"riječi opisa (nađeno: {n_words}).")
+    # --- Prvi ekran ---
+    naziv = naziv_iz_md(md)
+    ko = kratki_opis(md)
+    if "**Naziv proizvoda:**" not in sek.get("Prvi ekran", ""):
+        errors.append("Prvi ekran: nedostaje '**Naziv proizvoda:** …'.")
+    if not ko:
+        errors.append("Prvi ekran: nedostaje '**Kratki opis:** …'.")
+    else:
+        rec = recenice(ko)
+        lo, hi = meta["kratki_opis"]
+        if not lo <= len(rec) <= hi:
+            errors.append(f"Kratki opis ima {len(rec)} rečenica; template traži {lo}–{hi}.")
+        prva = rec[0] if rec else ""
+        zab = R.pocinje_zabranjeno(prva)
+        if zab:
+            errors.append(f"Prva rečenica kratkog opisa ne smije počinjati s „{zab}”.")
+        naziv_pocetak = norm_compact(" ".join(naziv.split()[:2]))
+        pocinje_nazivom = bool(naziv_pocetak) and norm_compact(prva).startswith(naziv_pocetak)
+        if pocinje_nazivom and upute.obrazac_opis and \
+                not G.obrazac_je_naziv(upute.obrazac_opis):
+            errors.append("Prva rečenica kratkog opisa počinje nazivom proizvoda, a "
+                          f"zadani obrazac ({upute.obrazac}) je: {upute.obrazac_opis}.")
+        if letter == "A" and podvrsta != "biljni čaj (nije dodatak prehrani)":
+            if "dodatak prehrani" not in prva.lower():
+                errors.append("Kategorija „dodatak prehrani” mora biti u prvoj rečenici "
+                              "kratkog opisa.")
+            oznaka = str((meta_inv or {}).get("oznaka_uz_naziv") or "").strip().lower()
+            if oznaka and oznaka not in prva.lower():
+                errors.append(f"Uz kategoriju u prvoj rečenici mora stajati „{oznaka}” "
+                              "(tako piše uz naziv na deklaraciji).")
+        if letter == "C" and podvrsta == T.POCETNA_FORMULA and \
+                "rođenj" not in ko.lower():
+            errors.append("Kod početne formule kratki opis navodi da je prikladna od "
+                          "rođenja kada dojenje nije moguće.")
+        poc = pocetak(prva)
+        if poc and any(norm_compact(poc) == norm_compact(z) for z in upute.zauzeti_poceci):
+            errors.append(f"Kontrola serije: prva rečenica počinje istim riječima "
+                          f"(„{poc}…”) kao opis drugog proizvoda iste kategorije.")
 
-    if 5 in tab_blocks:
-        for row in T.TAB5_REQUIRED_ROWS:
-            if row.lower() not in tab_blocks[5].lower():
-                errors.append(f"Tab 5 mora sadržavati redak '{row}'.")
-        if not has_table(tab_blocks[5]):
-            errors.append("Tab 5 mora sadržavati tablicu podataka.")
+    # --- Tab 1 ---
+    tab1_naslov = next((n for n in naslovi if n.startswith("Tab 1:")), None)
+    tab1 = sek.get(tab1_naslov, "") if tab1_naslov else ""
+    linije1 = [l.strip() for l in tab1.splitlines() if l.strip()]
+    if letter == "C":
+        if not linije1 or not linije1[0].upper().startswith("**VAŽNA NAPOMENA"):
+            errors.append("Tab 1 mora počinjati napomenom o dojenju "
+                          "('**VAŽNA NAPOMENA:** …').")
+        elif not re.search(r"majčino mlijeko|dojenj", linije1[0], re.IGNORECASE):
+            errors.append("Napomena o dojenju mora govoriti o majčinom mlijeku / dojenju.")
+    traka = next((l for l in linije1 if l.startswith("**Brza traka:**")), "")
+    if traka:
+        oznake = [o.strip() for o in traka.split(":**", 1)[1].split("·") if o.strip()]
+        if not 3 <= len(oznake) <= 6:
+            errors.append(f"Brza traka ima {len(oznake)} oznaka; dopušteno 3–6 "
+                          "(ili je izostavi ako nema 3 provjerena podatka).")
+        if "[PROVJERITI" in traka:
+            errors.append("Podatak označen za provjeru ne ide u brzu traku.")
+        if re.search(r"%\s*PU|\bPU\b|doprinos", traka):
+            errors.append("Brza traka ne smije sadržavati % PU ni tvrdnje.")
+        m = SLOGAN_RE.search(norm_spaced(traka))
+        if m:
+            errors.append(f"Brza traka sadrži skraćenu tvrdnju „{m.group(0)}”.")
+        if letter == "C" and podvrsta == T.POCETNA_FORMULA and re.search(
+                r"DHA|ARA|oligosahar|HMO|bifido|nukleotid|bez glutena|°C",
+                traka, re.IGNORECASE):
+            errors.append("Brza traka početne formule smije imati samo vrstu, dob, oblik, "
+                          "pakiranje i alergen (bez pojedinih sastojaka i pripreme).")
+        if len(oznake) and any(len(o.split()) > 8 for o in oznake):
+            errors.append("Oznaka u brzoj traci je kratka činjenica od nekoliko riječi.")
+    for h in re.findall(r"^###\s+(.+)$", tab1, re.M):
+        if R.je_genericki_podnaslov(h):
+            errors.append(f"Podnaslov „{h}” je općenit; podnaslov mora sadržavati "
+                          "podatak koji vrijedi samo za ovaj proizvod.")
+        m = SLOGAN_RE.search(norm_spaced(h))
+        if m:
+            errors.append(f"Podnaslov „{h}” sadrži skraćenu tvrdnju „{m.group(0)}”.")
+    proza1 = [l for l in linije1 if not l.startswith(("**Brza", "**VAŽNA", "|", "#", "- Sadrži"))]
+    naziv_kratko = norm_spaced(" ".join([w for w in naziv.split() if len(w) > 2][:2]))
+    if naziv_kratko:
+        broj = sum(norm_spaced(l).count(naziv_kratko) for l in proza1)
+        if broj > 1:
+            errors.append(f"Naziv proizvoda u tekstu Taba 1 stoji {broj} puta (najviše jednom).")
+    for l in proza1:
+        zab = R.pocinje_zabranjeno(l.lstrip("-* "))
+        if zab:
+            errors.append(f"Odlomak u Tabu 1 počinje s „{zab}”.")
+            break
 
-    if 6 in tab_blocks:
-        if "Stručni savjet ljekarnika" not in tab_blocks[6] or \
-                "izravnog kontakta s ljekarnikom" not in tab_blocks[6]:
-            errors.append("Tab 6 mora doslovno sadržavati fiksne natuknice iz "
-                          "kostura (savjet ljekarnika + izravan kontakt).")
+    # --- Tvrdnje ---
+    tvrdnje_stavke = [l[2:].strip() for l in tab1.splitlines()
+                      if l.strip().startswith("- Sadrži")]
+    if tvrdnje_stavke and not T.tvrdnje_dopustene(letter, podvrsta):
+        errors.append("Za ovaj proizvod zdravstvene i prehrambene tvrdnje nisu dopuštene; "
+                      "ukloni blok „Sadrži … doprinosi …”.")
+    elif tvrdnje_stavke and procjena is not None:
+        for g in G.neodobrene_tvrdnje(tvrdnje_stavke, procjena):
+            errors.append(f"Tvrdnja nije iz dokumenta tvrdnji (432/2012) ili uvjet nije "
+                          f"ispunjen: {g}")
+        for st in tvrdnje_stavke:
+            bez_uvjeta = re.sub(r"Koristan učinak postiže se[^.]*\.", "", st)
+            if re.search(r"\d+\s*(mg|µg|mcg|g|IU|%)", bez_uvjeta):
+                errors.append(f"Uz tvrdnju se ne pišu doza, količina ni % PU: „{st[:80]}”.")
+    if letter in ("A", "C"):
+        bez_tvrdnji = "\n".join(l for l in md.splitlines()
+                                if not l.strip().startswith("- Sadrži")
+                                and not l.strip().startswith("|"))
+        if re.search(r"\bdoprinos[ie]\b", bez_tvrdnji, re.IGNORECASE):
+            errors.append("Glagol „doprinosi” smije se koristiti samo u bloku tvrdnji.")
+        m = UCINAK_OBLIKA_RE.search(bez_tvrdnji)
+        if m:
+            errors.append(f"Tvrdnja o djelovanju oblika u tijelu („{m.group(0)}”) nije u "
+                          "dokumentu tvrdnji: oblik se objašnjava samo kao „što je to”, "
+                          "bez apsorpcije, podnošljivosti i učinka na želudac ili sluznicu.")
 
-    # --- Kliničke studije (ako postoje) ---
-    if has_studies:
-        pos = next(i for i, h in enumerate(headings)
-                   if h["level"] == 2 and h["title"].startswith("4. Kliničke"))
-        if not has_table(block_of(md, headings, pos)):
-            errors.append("Sekcija Kliničke studije mora sadržavati tablicu "
-                          "'Rezultat | Metoda mjerenja i izvor'.")
+    # --- [PROVJERITI] samo za podatak, ne za rečenicu ---
+    if re.search(r"\[PROVJERITI:[^\]\n]*\n", md):
+        errors.append("Oznaka [PROVJERITI: …] ne smije prelaziti u novi redak ni "
+                      "obuhvaćati tablicu; označi pojedinačne vrijednosti.")
+    for m in R.PROVJERITI_RE.finditer(md):
+        sadrzaj = (m.group(1) or "").strip()
+        if len(sadrzaj.split()) > 14 and sadrzaj.count(",") < 4:
+            errors.append(f"[PROVJERITI: …] obuhvaća cijelu rečenicu („{sadrzaj[:60]}…”); "
+                          "oznaka je samo za konkretan podatak. Podatak s eLjekarne24 ili "
+                          "stranice brenda piše se normalno, a nepotvrđen opis se izostavlja.")
+            break
 
-    # --- Recenzije (fiksni tekst) ---
-    rev_pos = next((i for i, h in enumerate(headings)
-                    if h["level"] == 2 and "Ocjene i recenzije" in h["title"]), None)
-    if rev_pos is not None:
-        body = block_of(md, headings, rev_pos)
-        if "eLjekarna24" not in body or "recenzij" not in body.lower():
-            errors.append("Blok recenzija mora se doslovno prepisati iz kostura "
-                          "(stvarne recenzije iz sustava eLjekarna24).")
+    # --- Tablica podataka ---
+    if meta.get("data_tab") and meta.get("data_rows"):
+        tabn = next((n for n in naslovi if n.startswith(f"Tab {meta['data_tab']}:")), None)
+        redovi = tablica(sek.get(tabn, "")) if tabn else []
+        podaci = [r for r in redovi if r and r[0].lower() != "podatak"]
+        oznake_red = [R.PROVJERITI_RE.sub(lambda m: m.group(1) or "", r[0]).strip()
+                      for r in podaci]
+        if not podaci:
+            errors.append(f"Tab {meta['data_tab']} mora imati tablicu "
+                          "'| Podatak | Vrijednost |'.")
+        else:
+            if [norm_compact(o) for o in oznake_red] != \
+                    [norm_compact(o) for o in meta["data_rows"]]:
+                errors.append("Tablica podataka mora imati točno ove retke, ovim "
+                              f"redom: {', '.join(meta['data_rows'])}.")
+            for r, oz in zip(podaci, oznake_red):
+                vr = r[1].strip() if len(r) > 1 else ""
+                if not vr and "[PROVJERITI" not in r[0]:
+                    errors.append(f"Prazan redak '{oz}' u tablici podataka mora imati "
+                                  f"naziv retka označen kao [PROVJERITI: {oz}].")
+                if norm_compact(oz) == "ean" and vr:
+                    znam = re.sub(r"\D", "", vr)
+                    ean_izvor = inventory.ean if inventory is not None else ""
+                    if ean_izvor and znam and znam != ean_izvor and "[PROVJERITI" not in vr:
+                        errors.append(f"EAN {znam} se ne slaže s EAN-om iz izvora ({ean_izvor}).")
+    if product.sku and re.search(rf"\b{re.escape(product.sku)}\b", md):
+        errors.append("Šifra proizvoda / SKU ne upisuje se nigdje u opisu.")
+
+    # --- Obvezne rečenice ---
+    for rec in meta.get("obvezne_recenice", []):
+        if letter == "A" and podvrsta == "biljni čaj (nije dodatak prehrani)":
+            break
+        if norm_spaced(rec) not in norm_spaced(md):
+            errors.append(f"Nedostaje obvezna rečenica (doslovno): „{rec}”")
 
     # --- FAQ ---
-    faq_pos = next((i for i, h in enumerate(headings)
-                    if h["level"] == 2 and "(FAQ)" in h["title"]), None)
-    if faq_pos is not None:
-        faq_block = block_of(md, headings, faq_pos)
-        questions = [h for h in headings
-                     if h["level"] == 3 and h["line"] > headings[faq_pos]["line"]]
-        q_ok = [q for q in questions if q["title"].endswith("?")]
-        if not FAQ_MIN <= len(q_ok) <= FAQ_MAX:
-            errors.append(f"FAQ mora imati {FAQ_MIN}–{FAQ_MAX} pitanja koja "
-                          f"završavaju upitnikom (nađeno: {len(q_ok)}).")
-        if len(q_ok) != len(questions):
-            errors.append("Svaki FAQ podnaslov mora biti pitanje (završava s '?').")
-        for q in q_ok:
-            ans = block_of(md, headings, headings.index(q)).strip()
-            if len(ans) < 20:
-                errors.append(f"FAQ pitanje '{q['title']}' nema sadržajan odgovor.")
-        del faq_block
+    faq = sek.get("Česta pitanja", "")
+    if faq.strip():
+        if not T.faq_dopusten(letter, podvrsta):
+            errors.append("FAQ se za ovaj proizvod ne stavlja; ukloni odjeljak.")
+        pitanja = re.findall(r"^\*\*(.+?\?)\*\*\s*$", faq, re.M)
+        if len(pitanja) > meta["faq_max"]:
+            errors.append(f"FAQ ima {len(pitanja)} pitanja (najviše {meta['faq_max']}).")
+        dijelovi = re.split(r"^\*\*.+?\?\*\*\s*$", faq, flags=re.M)[1:]
+        for q, odg in zip(pitanja, dijelovi):
+            odg = odg.strip()
+            if not odg:
+                errors.append(f"FAQ pitanje „{q}” nema odgovor.")
+                continue
+            if len(recenice(odg)) > 3:
+                errors.append(f"Odgovor na „{q}” ima više od 3 rečenice.")
+            if YES_NO_RE.match(q) and not re.match(r"(Da|Ne)\b", odg):
+                errors.append(f"Na da/ne pitanje „{q}” odgovor počinje s „Da” ili „Ne”.")
+            if re.search(r"posavjetujte se|provjerite kod|obratite se", odg, re.IGNORECASE) \
+                    and len(recenice(odg)) <= 1:
+                errors.append(f"Odgovor na „{q}” nema konkretan podatak.")
 
-    # --- Obvezne fraze kategorije ---
-    for phrase, message in t["mandatory_phrases"]:
-        options = phrase if isinstance(phrase, (tuple, list)) else (phrase,)
-        if not any(o.lower() in md.lower() for o in options):
-            errors.append(f"Nedostaje obvezni element: {message}.")
-
-    # --- Ograde ("prema deklaraciji" i sl.) ---
-    low = md.lower()
-    if not any(h in low for h in HEDGE_PHRASES):
-        errors.append("Dokument mora sadržavati ograde poput 'prema deklaraciji' "
-                      "ili 'prema podacima proizvoda'.")
-
-    # --- Zabranjeni izrazi ---
-    for hit in find_forbidden(md):
-        if any(w in hit.lower() for w in
-               {x for x in norm_spaced(product.naziv).split() if len(x) > 3}):
-            continue
-        errors.append(f"Zabranjeni izraz u dokumentu: {hit}.")
-    # riječ koja je dio naziva, brenda ili naziva linije na stranici proizvoda
-    # nije tvrdnja (npr. „Intense Protect“, „Ultra“, „Optimal“)
-    izvor_naziva = product.naziv + " " + product.brend + " " + " ".join(
-        s.text[:300] for s in sources if s.kind == "stranica proizvoda")
-    naziv_rijeci = {w for w in norm_spaced(izvor_naziva).split() if len(w) > 3}
-    for hit in R.nadi_zabranjene_rijeci(md):
-        if any(w in hit.lower() for w in naziv_rijeci):
-            continue            # riječ je dio naziva ili brenda, ne tvrdnja
-        errors.append(f"Zabranjena riječ: {hit}.")
-
-    # --- Z2: interne napomene ne smiju u tekst za kupca ---
+    # --- Zabranjeni izrazi, interne napomene, crtice, stil ---
+    javni = "\n".join(l for l in md.splitlines()
+                      if not l.lower().startswith(("| meta", "| alt")))
+    for hit in find_forbidden(javni):
+        errors.append(f"Zabranjen izraz: {hit}.")
+    for hit in R.nadi_zabranjene_rijeci(javni, lijek=(letter == "K")):
+        if not any(hit.split("“")[0] in e for e in errors):
+            errors.append(f"Zabranjena riječ ili fraza: {hit}.")
     for hit in R.nadi_interne_napomene(md):
-        errors.append(f"Interna napomena u tekstu za kupca: {hit}. Takve podatke "
-                      "vrati samo u JSON poljima, nikad u dokumentu.")
-
-    # --- Z4: crtice ---
+        errors.append(f"Ne smije biti u javnom tekstu: {hit}.")
     crtice = R.nadi_crtice(md)
     if crtice:
-        errors.append(f"Dokument sadrži {len(crtice)} crtica (– ili —). Umjesto "
-                      "njih koristi zarez ili točku; crtica smije ostati samo u "
-                      "rasponu brojeva (22–42 cm).")
-
-    # --- tvrdnje „testirano“ bez objašnjenja ---
+        errors.append(f"Dokument sadrži {len(crtice)} crtica (– ili —); umjesto njih "
+                      "zarez ili točka (crtica smije biti samo u rasponu brojeva).")
+    if R.ima_usklicnik_ili_emoji(md):
+        errors.append("Bez uskličnika i emojija.")
     for hit in R.nadi_tvrdnje_bez_objasnjenja(md):
         errors.append(f"Tvrdnja bez objašnjenja: {hit}.")
 
-    # --- brzi podaci: šest popunjenih polja ---
-    if sec1_pos is not None:
-        for h in headings:
-            if h["level"] == 3 and h["title"] == "Brza traka ispod opisa":
-                body = block_of(md, headings, headings.index(h))
-                for polje in T.BRZA_TRAKA_POLJA:
-                    red = re.search(rf"\|\s*{re.escape(polje)}\s*\|([^|]*)\|", body)
-                    if not red:
-                        errors.append(f"Brza traka nema polje „{polje}“. Obvezno je "
-                                      "svih šest polja.")
-                    elif len(red.group(1).strip()) < 2 or "{" in red.group(1):
-                        errors.append(f"Polje „{polje}“ u brzoj traci nije popunjeno "
-                                      "konkretnim podatkom iz izvora.")
-                break
+    # --- Brojevi s jedinicom moraju postojati u izvorima ---
+    izvor_specs = spec_tokens(product.naziv + " " + " ".join(s.text for s in sources))
+    if inventory is not None:
+        izvor_specs |= spec_tokens(" ".join(f.vrijednost for f in inventory.facts))
+        izvor_specs |= spec_tokens(json.dumps(inventory.meta, ensure_ascii=False))
+    for tok in sorted(spec_tokens(md) - izvor_specs):
+        errors.append(f"Podatak '{tok}' ne postoji u izvorima ni u nazivu.")
 
-    # --- istaknuti sastojci: točno 3 ili 4 ---
-    sastojci_tab = {"cosmetics": 4, "supplement": 4, "formula": 3}.get(category)
-    if sastojci_tab and sastojci_tab in tab_blocks:
-        # broji se SAMO prva tablica (istaknuti sastojci); puni sastav i
-        # nutritivna tablica dolaze ispod i ne ulaze u brojanje
-        redovi, u_tablici = [], False
-        for ln in tab_blocks[sastojci_tab].splitlines():
-            je_red = ln.strip().startswith("|")
-            if je_red:
-                u_tablici = True
-                if "---" not in ln:
-                    redovi.append(ln)
-            elif u_tablici and ln.strip():
-                break
-        broj = max(0, len(redovi) - 1)          # bez zaglavlja
-        if redovi and not 3 <= broj <= 4:
-            errors.append(f"Istaknutih sastojaka mora biti 3 ili 4 (nađeno: {broj}). "
-                          "Nutritivna tablica i puni sastav idu odvojeno, ispod.")
-
-    # --- kliničke studije: svaki redak s vremenom, brojem ispitanika i metodom ---
-    if has_studies:
-        pos = next(i for i, h in enumerate(headings)
-                   if h["level"] == 2 and h["title"].startswith("4. Kliničke"))
-        blok = block_of(md, headings, pos)
-        for ln in blok.splitlines():
-            if not ln.strip().startswith("|") or "---" in ln:
-                continue
-            if re.search(r"\|\s*Rezultat\s*\|", ln, re.IGNORECASE):
-                continue
-            ima_broj = re.search(r"\d+\s*ispitanik", ln, re.IGNORECASE)
-            ima_vrijeme = re.search(r"\d+\s*(tjedan|tjedn|dan|dana|sat|sati|mjesec)",
-                                    ln, re.IGNORECASE)
-            ima_metodu = re.search(r"(procjen|mjerenj|metod|instrumental|ispitivanj)",
-                                   ln, re.IGNORECASE)
-            if not (ima_broj and ima_vrijeme and ima_metodu):
-                errors.append("Redak kliničkih studija nema sve obvezno (rezultat, "
-                              "vrijeme, broj ispitanika, metoda, izvor). Ako podaci "
-                              "nisu potpuni, IZOSTAVI cijeli blok Kliničke studije.")
-                break
-
-    # --- obvezni podaci u Tab 5 ---
-    if 5 in tab_blocks:
-        for polje, naziv in (("EAN", "EAN"), ("Proizvođač", "proizvođač"),
-                             ("Pakiranje", "pakiranje")):
-            red = re.search(rf"\|\s*{polje}[^|]*\|([^|]*)\|", tab_blocks[5],
-                            re.IGNORECASE)
-            if red and not red.group(1).strip():
-                errors.append(f"Obvezan podatak „{naziv}“ u Tabu 5 je prazan.")
-
-    # --- EAN ---
-    src_compact = norm_compact(product.naziv + " " +
-                               " ".join(s.text for s in sources))
-    for m in re.finditer(r"^\|\s*EAN[^|]*\|\s*([^|]+)\|", md,
-                         flags=re.MULTILINE | re.IGNORECASE):
-        cell = m.group(1).strip()
-        digits = re.sub(r"\D", "", cell)
-        if digits:
-            if len(digits) not in (8, 12, 13, 14):
-                errors.append(f"EAN '{cell}' nema valjan broj znamenki.")
-            elif digits not in src_compact:
-                errors.append(f"EAN '{digits}' ne postoji u izvorima — upotrijebi "
-                              f"placeholder: '{T.PLACEHOLDER_UNKNOWN}'.")
-        elif T.PLACEHOLDER_UNKNOWN not in cell:
-            errors.append("EAN bez vrijednosti mora sadržavati placeholder: "
-                          f"'{T.PLACEHOLDER_UNKNOWN}'.")
-
-    # --- Brojevi s jedinicama moraju postojati u izvorima ---
-    source_specs = spec_tokens(product.naziv + " " +
-                               " ".join(s.text for s in sources))
-    # brojevi zapisani uz oznaku pakiranja („a18“, „x30“) vrijede kao potvrda
-    brojevi_iz_naziva = set(re.findall(r"\d+", product.naziv))
-    for tok in sorted(spec_tokens(md)):
-        broj = re.match(r"[\d.]+", tok)
-        if broj and broj.group(0).rstrip(".") in brojevi_iz_naziva:
-            continue
-        if tok not in source_specs:
-            errors.append(f"Podatak '{tok}' ne postoji u izvorima ni u nazivu — "
-                          "ukloni ga ili zamijeni potvrđenim podatkom.")
-
+    # --- Kopiranje s usporednih izvora ---
+    usporedni = [s.text for s in sources if s.usporedni]
+    for frag in R.preuzeti_odlomci(md, usporedni)[:3]:
+        errors.append(f"Tekst preuzet s usporedne ljekarne/webshopa („{frag}…”); "
+                      "napiši vlastitim riječima.")
     return errors
 
 
 # ---------------------------------------------------------------------------
-# Markdown -> DOCX (python-docx)
+# Markdown -> DOCX (neprovjereni podaci crvenom bojom)
 # ---------------------------------------------------------------------------
 
-BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+RUN_RE = re.compile(r"\*\*(.+?)\*\*|\[PROVJERITI(?::\s*([^\]]*))?\]|\*(.+?)\*")
 
 
-def _add_runs(paragraph, text: str) -> None:
+def _add_runs(paragraph, text: str, bold: bool = False) -> None:
+    from docx.shared import RGBColor
+
+    red = RGBColor(0xC0, 0x00, 0x00)
     pos = 0
-    for m in BOLD_RE.finditer(text):
+    for m in RUN_RE.finditer(text):
         if m.start() > pos:
-            paragraph.add_run(text[pos:m.start()])
-        paragraph.add_run(m.group(1)).bold = True
+            paragraph.add_run(text[pos:m.start()]).bold = bold or None
+        if m.group(1) is not None:
+            _add_runs(paragraph, m.group(1), bold=True)
+        elif m.group(0).startswith("[PROVJERITI"):
+            run = paragraph.add_run(m.group(2) if m.group(2) else "[PROVJERITI]")
+            run.font.color.rgb = red
+            run.bold = bold or None
+        else:
+            run = paragraph.add_run(m.group(3))
+            run.italic = True
         pos = m.end()
     if pos < len(text):
-        paragraph.add_run(text[pos:])
+        paragraph.add_run(text[pos:]).bold = bold or None
 
 
 def md_to_docx(md: str, out_path: Path) -> None:
@@ -1433,22 +1479,19 @@ def md_to_docx(md: str, out_path: Path) -> None:
     i = 0
     while i < len(lines):
         line = lines[i].rstrip()
-
         if not line.strip():
             i += 1
             continue
-
         m = HEADING_RE.match(line)
         if m:
-            doc.add_heading(m.group(2), level=len(m.group(1)))
+            doc.add_heading(m.group(2), level=len(m.group(1)) - 1 if len(m.group(1)) > 1 else 0)
             i += 1
             continue
-
         if line.strip().startswith("|"):
             rows = []
             while i < len(lines) and lines[i].strip().startswith("|"):
                 cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
-                if not all(re.fullmatch(r":?-{3,}:?", c) for c in cells):
+                if not all(re.fullmatch(r":?-{3,}:?", c) for c in cells if c):
                     rows.append(cells)
                 i += 1
             if rows:
@@ -1459,25 +1502,83 @@ def md_to_docx(md: str, out_path: Path) -> None:
                     for c in range(n_cols):
                         cell = table.cell(r, c)
                         cell.text = ""
-                        para = cell.paragraphs[0]
-                        _add_runs(para, row[c] if c < len(row) else "")
-                        if r == 0:
-                            for run in para.runs:
-                                run.bold = True
+                        _add_runs(cell.paragraphs[0], row[c] if c < len(row) else "",
+                                  bold=(r == 0))
                 doc.add_paragraph("")
             continue
-
-        if line.strip().startswith(("- ", "* ")):
-            para = doc.add_paragraph(style="List Bullet")
-            _add_runs(para, line.strip()[2:])
-            i += 1
-            continue
-
-        para = doc.add_paragraph()
-        _add_runs(para, line.strip())
+        s = line.strip()
+        if s.startswith(("- ", "* ")):
+            _add_runs(doc.add_paragraph(style="List Bullet"), s[2:])
+        elif re.match(r"\d+\.\s", s):
+            _add_runs(doc.add_paragraph(style="List Number"), re.sub(r"^\d+\.\s+", "", s))
+        else:
+            _add_runs(doc.add_paragraph(), s)
         i += 1
-
     doc.save(str(out_path))
+
+
+# ---------------------------------------------------------------------------
+# Klasifikacija i priprema uputa
+# ---------------------------------------------------------------------------
+
+def klasificiraj(product: Product, sources: list[Source], client) -> tuple[str, str, str]:
+    """(template, podvrsta, razlog). Bez modela: heuristika."""
+    kat = T.kategorija_za(product.sekcija)
+    dopusteni = list(T.dopusteni_templateovi(kat))
+    letter = T.category_for(product.sekcija, product.naziv)
+    podvrsta = T.podvrsta_heuristika(letter, product.naziv)
+    if client is None:
+        return letter, podvrsta, "heuristika (bez modela)"
+    treba = len(dopusteni) > 1 or any(d in T.PODVRSTE for d in dopusteni)
+    if not treba:
+        return letter, podvrsta, "jedini template u kategoriji"
+    s1 = sources[0].text if sources else ""
+    raw = client.extract(
+        X.build_classify_system(T.odabir_tekst(kat), dopusteni, T.PODVRSTE),
+        X.build_classify_user(product, s1))
+    data = X.parse_classification(raw)
+    l2 = str(data.get("template", "")).strip().upper()[:1]
+    if l2 in dopusteni:
+        letter = l2
+        pv = str(data.get("podvrsta", "")).strip()
+        opcije = T.PODVRSTE.get(letter, [])
+        podvrsta = next((o for o in opcije if o.lower() == pv.lower()), None) or \
+            next((o for o in opcije if pv.lower() and pv.lower() in o.lower()), None) or \
+            T.podvrsta_heuristika(letter, product.naziv)
+        return letter, podvrsta, str(data.get("razlog", ""))[:200]
+    return letter, podvrsta, "heuristika (klasifikator nije vratio dopušten template)"
+
+
+def pripremi_upute(letter: str, podvrsta: str, inventory, sources: list[Source],
+                   zauzeti: list[str]) -> tuple[Upute, G.Procjena | None, list[str]]:
+    upute = Upute(zauzeti_poceci=list(zauzeti))
+    regulatorno: list[str] = []
+    ean = (inventory.ean if inventory is not None else "") or \
+        (ean_sa_stranice(sources[0].text) if sources else "")
+    upute.obrazac, upute.obrazac_opis = G.obrazac_prve_recenice(
+        ean, pocetna_formula=(letter == "C" and podvrsta == T.POCETNA_FORMULA))
+    if letter == "K":
+        upute.obrazac_opis = ("terapijskim indikacijama iz Upute o lijeku (Template K "
+                              "ne koristi obrasce)")
+    procjena = None
+    if letter in ("A", "C") and inventory is not None:
+        procjena = G.procijeni(inventory.aktivne_tvari, dodatak_prehrani=(letter == "A"))
+        upute.regulativa = G.blok_za_prompt(procjena, T.tvrdnje_dopustene(letter, podvrsta))
+        regulatorno += procjena.upozorenja
+        if letter == "A":
+            nazivi = [t.tvar for t in procjena.tvari] + \
+                [str(b.get("hr", "")) + " " + str(b.get("lat", ""))
+                 for b in inventory.meta.get("biljne_vrste") or [] if isinstance(b, dict)]
+            upute.prilog_ii = G.izvadak_priloga_ii(nazivi)
+    if letter == "C" and podvrsta == T.POCETNA_FORMULA and inventory is not None and \
+            str(inventory.meta.get("promocija_na_stranici", "")).lower() == "da":
+        regulatorno.append("Početna formula: na stranici eLjekarne24 vidljiv je popust/akcija, "
+                           "što Delegirana uredba (EU) 2016/127 ne dopušta — javiti.")
+    oznaka = str((inventory.meta if inventory is not None else {}).get("oznaka_uz_naziv") or "")
+    if letter == "A" and oznaka:
+        upute.dodatno.append(f"Na deklaraciji uz naziv piše „{oznaka}”: prva rečenica "
+                             f"kratkog opisa sadrži „dodatak prehrani {oznaka}”.")
+    return upute, procjena, regulatorno
 
 
 # ---------------------------------------------------------------------------
@@ -1485,24 +1586,25 @@ def md_to_docx(md: str, out_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def process_product(product: Product, category: str, sources: list[Source],
-                    client: BedrockClient, max_attempts: int,
-                    do_verify: bool, do_extract: bool = True,
-                    do_coverage: bool = True) -> tuple[RowResult, str]:
-    result = RowResult(product=product, category=category, sources=sources,
-                       model_id=client.model_id)
-    system_prompt = build_gen_system(category)
+                    client, max_attempts: int, do_verify: bool = True,
+                    do_extract: bool = True, do_coverage: bool = True,
+                    podvrsta: str = "", zauzeti_poceci: list[str] | None = None,
+                    ) -> tuple[RowResult, str]:
+    letter = category
+    podvrsta = podvrsta or T.podvrsta_heuristika(letter, product.naziv)
+    result = RowResult(product=product, category=letter, podvrsta=podvrsta,
+                       sources=list(sources), model_id=client.model_id)
 
-    # --- 1. STRUKTURIRANA EKSTRAKCIJA PRIJE PISANJA ---
+    # --- 1. ekstrakcija ---
     inventory = None
     if do_extract and sources:
-        inventory = None
         for pokusaj in range(2):
             raw_inv = client.extract(
-                X.build_extract_system(category),
+                X.build_extract_system(letter),
                 X.build_extract_user(product, sources_block(sources))
                 + ("\n\nPRETHODNI ODGOVOR NIJE BIO VALJAN JSON. Vrati "
                    "ISKLJUČIVO JSON, bez teksta okolo." if pokusaj else ""))
-            inventory = X.parse_inventory(raw_inv, category)
+            inventory = X.parse_inventory(raw_inv, letter)
             if inventory.ok:
                 break
         result.inventory = inventory
@@ -1512,130 +1614,140 @@ def process_product(product: Product, category: str, sources: list[Source],
             return result, ""
         result.conflicts = [f"{f.polje}: {f.konflikt or f.vrijednost}"
                             for f in inventory.conflicts()]
+        # izvori koji nisu isti proizvod i pakiranje ne idu piscu
+        isti = inventory.isti_proizvod()
+        odbaceni = [s for s in sources if s.sid != "S1" and isti.get(s.sid) is False]
+        if odbaceni:
+            sources = [s for s in sources if s not in odbaceni]
+            result.info.append("odbačeni izvori (drugi proizvod ili pakiranje): "
+                               + ", ".join(f"{s.sid} {s.url}" for s in odbaceni))
+            for i, s in enumerate(sources, start=1):
+                s.sid = f"S{i}"
+            result.sources = list(sources)
+            # inventar je izvučen i iz odbačenih izvora: izvuci ga ponovno samo
+            # iz izvora koji su isti proizvod, da njihovi podaci ne uđu u opis
+            ponovno = X.parse_inventory(client.extract(
+                X.build_extract_system(letter),
+                X.build_extract_user(product, sources_block(sources))), letter)
+            if ponovno.ok:
+                inventory = result.inventory = ponovno
+                result.conflicts = [f"{f.polje}: {f.konflikt or f.vrijednost}"
+                                    for f in inventory.conflicts()]
+
+    # --- 2. regulativa ---
+    if letter == "A" and inventory is not None:
+        tekst = json.dumps(inventory.meta.get("biljne_vrste") or [], ensure_ascii=False) + \
+            " ".join(f.vrijednost for f in inventory.found())
+        zabranjene = G.zabranjene_biljke(tekst)
+        if zabranjene:
+            result.status = STATUS_STOP
+            result.regulatorno.append("Proizvod sadrži biljnu vrstu s Priloga III. "
+                                      "Pravilnika NN 160/2013: " + ", ".join(zabranjene)
+                                      + ". Opis se ne piše (checklista).")
+            return result, ""
+    upute, procjena, regulatorno = pripremi_upute(letter, podvrsta, inventory, sources,
+                                                  zauzeti_poceci or [])
+    result.regulatorno += regulatorno
+    result.obrazac = f"{upute.obrazac}: {upute.obrazac_opis}"
+
+    system_prompt = build_gen_system(letter, podvrsta)
+    verify_system = build_verify_system(letter, podvrsta) if do_verify else ""
+    ean = (inventory.ean if inventory is not None else "") or \
+        (ean_sa_stranice(sources[0].text) if sources else "")
 
     feedback: str | None = None
-    best_md, best_issues = "", None
-    best_score = (-1, -10 ** 6)  # (struktura prošla?, -broj problema)
+    best_md, best_issues, best_json = "", None, {}
+    best_score = (-1, -10 ** 6)
 
-    def consider(md_text: str, issues: list[str], structure_ok: bool) -> None:
-        nonlocal best_md, best_issues, best_score
-        score = (1 if structure_ok else 0, -len(issues))
+    def consider(md_text: str, issues: list[str], stage: int, js: dict) -> None:
+        nonlocal best_md, best_issues, best_score, best_json
+        score = (stage, -len(issues))
         if score > best_score:
-            best_md, best_issues, best_score = md_text, list(issues), score
+            best_md, best_issues, best_score, best_json = md_text, list(issues), score, js
 
     for attempt in range(1, max_attempts + 1):
         result.attempts = attempt
         raw = client.generate(system_prompt,
-                              build_gen_user(product, category, sources, feedback,
-                                             inventory))
-        raw, interni_json = odvoji_json_blok(raw)
+                              build_gen_user(product, letter, podvrsta, sources,
+                                             feedback, inventory, upute))
+        raw, interni = odvoji_json_blok(raw)
         md = clean_markdown(raw)
-        md = R.ukloni_crtice(md)                    # Z4, sigurnosna mreža
-        md = R.normaliziraj_multipak(md)            # „3 × 18 tableta“
-        md, ean_upisan = upisi_ean(md, inventory)   # potvrđen EAN ide u Tab 5
+        md = R.ukloni_crtice(md)
+        md = R.normaliziraj_multipak(md)
+        md, ean_upisan = upisi_ean(md, ean)
         if ean_upisan:
-            result.info.append("EAN iz izvora automatski upisan u Tab 5")
-        md = R.primijeni_rjecnik(md)                # ujednačen zapis brendova
-        result.nedostaje = [str(x) for x in (interni_json.get("nedostaje") or [])]
-        if interni_json.get("konflikti"):
-            result.conflicts = [str(x) for x in interni_json["konflikti"]]
+            result.info.append("EAN iz izvora automatski upisan u tablicu podataka")
+        md = R.primijeni_rjecnik(md)
 
-        errors = validate_pdp(md, product, category, sources)
+        errors = validate_pdp(md, product, letter, podvrsta, sources, inventory,
+                              procjena, upute,
+                              inventory.meta if inventory is not None else {})
         if errors:
-            consider(md, errors, structure_ok=False)
-            feedback = ("ISPRAVI SAMO NAVEDENO i vrati CIJELI dokument s "
-                        "nepromijenjenim ostatkom. Ne preoblikuj dijelove koji "
-                        "nisu navedeni.\n"
-                        "Greške automatske kontrole formata i sadržaja:\n"
+            consider(md, errors, 0, interni)
+            feedback = ("Greške automatske kontrole (pravila templatea i checkliste):\n"
                         + "\n".join(f"- {e}" for e in errors))
             continue
 
-        if not do_verify:
-            result.status = "OK (bez verifikacije)"
+        if do_coverage and inventory is not None:
+            gaps = X.coverage_check(inventory, md)
+            if gaps:
+                result.coverage = gaps
+                consider(md, gaps, 1, interni)
+                feedback = ("Podaci koji POSTOJE u izvorima nisu preneseni u opis. "
+                            "Dopuni opis tim podacima u odgovarajućem tabu:\n"
+                            + "\n".join(f"- {g}" for g in gaps))
+                continue
+            result.coverage = []
+
+        if do_verify:
+            verdict = parse_verifier_json(client.verify(
+                verify_system, build_verify_user(product, sources, md, upute)))
+            if verdict is None:
+                result.verified = "neuspjelo parsiranje odgovora stručne provjere"
+                result.notes.append("stručna provjera nije vratila valjan JSON")
+            elif not verdict.get("prolazi") and verdict["greske"]:
+                issues = [f"[{g.get('vrsta', '')}] {g.get('mjesto', '')}: {g['problem']}"
+                          + (f" → {g['ispravak']}" if g.get("ispravak") else "")
+                          for g in verdict["greske"]]
+                consider(md, issues, 2, interni)
+                result.verified = "ne prolazi"
+                feedback = ("Stručna provjera (drugi agent) našla je greške. Ispravi ih:\n"
+                            + "\n".join(f"- {i}" for i in issues))
+                continue
+            else:
+                result.verified = "prolazi"
+                if verdict.get("napomena"):
+                    result.info.append(f"stručna provjera: {verdict['napomena']}")
+        else:
             result.verified = "preskočeno"
-            return result, md
 
-        verdict_raw = client.verify(build_verify_system(),
-                                    build_verify_user(product, sources, md))
-        verdict = parse_verifier_json(verdict_raw)
-        if verdict is None:
-            result.status = "OK"
-            result.verified = "neuspjelo parsiranje odgovora kontrolora"
-            result.notes.append("kontrolor nije vratio valjan JSON — ručno provjeriti")
-            return result, md
-
-        claims = [c["tvrdnja"] for c in verdict["nepotkrijepljene_tvrdnje"]]
-        if verdict.get("prolazi") and not claims:
-            result.verified = "prolazi"
-            if verdict.get("napomena"):
-                result.info.append(f"kontrolor: {verdict['napomena']}")
-
-            # --- COVERAGE CHECK: je li išta izgubljeno iz izvora? ---
-            gaps_sve = []
-            if do_coverage and inventory is not None:
-                gaps_sve = X.coverage_check(inventory, md) + \
-                    X.placeholder_instead_of_value(inventory, md)
-            # blokiraju samo obvezni podaci; sporedne praznine su informativne
-            gaps = [g for g in gaps_sve
-                    if g.startswith("HARD FIELD") or g.startswith("EAN ")
-                    or "ostao placeholder" in g]
-            result.info.extend(g for g in gaps_sve if g not in gaps)
-            if not gaps:
-                razlozi, informativno = [], []
-                obvezni = [n for n in result.nedostaje
-                           if re.search(r"ean|proizvo|pakiranj|sastav",
-                                        str(n), re.IGNORECASE)]
-                if obvezni:
-                    poruka = "nedostaje obvezan podatak: " + ", ".join(obvezni)
-                    (razlozi if STROGI_NACIN else informativno).append(poruka)
-                if any(s.kind == SECONDARY_LABEL for s in sources):
-                    poruka = "korišten je izvor 2 (stranica brenda)"
-                    (razlozi if STROGI_NACIN else informativno).append(poruka)
-                if result.conflicts:
-                    # neslaganje je zabilježeno u stupcu Konflikti; tekst je ispravan
-                    informativno.append("neslaganje izvora zabilježeno interno")
-                result.info.extend(informativno)
-                # t.8: OK samo ako validator nema nijednu napomenu
-                if razlozi or result.notes:
-                    result.status = "TREBA PROVJERA"
-                    result.notes.extend(razlozi)
-                else:
-                    result.status = "OK"
-                return result, md
-
-            result.coverage = gaps
-            consider(md, gaps, structure_ok=True)
-            feedback = ("COVERAGE CHECK: podatci koji POSTOJE u izvorima nisu "
-                        "završili u PDP-u ili su zamijenjeni općom napomenom. "
-                        "Dopuni dokument tim podatcima (bez izmišljanja i bez "
-                        "mijenjanja formata):\n"
-                        + "\n".join(f"- {g}" for g in gaps))
-            continue
-
-        issues = [f"Nepotkrijepljena tvrdnja: \"{c['tvrdnja']}\" "
-                  f"({c.get('razlog', 'nema izvora')})"
-                  for c in verdict["nepotkrijepljene_tvrdnje"]] or \
-                 ["Kontrolor je odbio dokument bez navedenih tvrdnji."]
-        consider(md, issues, structure_ok=True)
-        feedback = ("Kontrolor činjenica (drugi agent) pronašao je "
-                    "nepotkrijepljene tvrdnje. Ukloni ih, zamijeni potvrđenim "
-                    "podacima iz izvora ili propisanim placeholderom:\n"
-                    + "\n".join(f"- {i}" for i in issues))
+        return _zavrsi(result, md, interni, sources, ok=True), \
+            dodaj_tablicu_izvora(md, sources, interni.get("izvori") or {})
 
     issues = best_issues or ["model nije vratio upotrebljiv dokument"]
-    coverage_issues = [i for i in issues
-                       if "nije prenesen u PDP" in i or "zamijenjen" in i
-                       or "Konflikt izvora" in i]
-    result.unsupported = [i for i in issues if "tvrdnja" in i.lower()]
-    result.coverage = coverage_issues
-    if coverage_issues and not result.unsupported:
-        result.status = "NEDOSTAJE PODATAK IZ IZVORA"
-        result.verified = "prolazi (fact-check), coverage ne prolazi"
-    else:
-        result.status = "TREBA PROVJERA"
-        result.verified = "ne prolazi"
+    result.unsupported = [i for i in issues if i.startswith(("[činjenica]", "[regulativa]"))
+                          or "dokumenta tvrdnji" in i]
     result.notes.extend(issues)
-    return result, best_md
+    _zavrsi(result, best_md, best_json, sources, ok=False)
+    md_out = dodaj_tablicu_izvora(best_md, sources, best_json.get("izvori") or {}) \
+        if best_md.strip() else ""
+    return result, md_out
+
+
+def _zavrsi(result: RowResult, md: str, interni: dict, sources: list[Source],
+            ok: bool) -> RowResult:
+    result.nedostaje = [str(x) for x in (interni.get("nedostaje") or [])]
+    if interni.get("konflikti"):
+        result.conflicts = [str(x) for x in interni["konflikti"]]
+    result.provjeriti = oznake_za_provjeru(md)
+    result.prva_recenica = (recenice(kratki_opis(md)) or [""])[0]
+    if not ok:
+        result.status = STATUS_REVIEW
+    elif result.provjeriti or result.nedostaje or result.regulatorno:
+        result.status = STATUS_REVIEW if STROGI_NACIN else STATUS_PROVJERITI
+    else:
+        result.status = STATUS_OK
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1654,7 +1766,6 @@ def load_products(path: Path) -> list[Product]:
         df = pd.read_csv(path, dtype=str, keep_default_na=False)
     else:
         df = pd.read_excel(path, dtype=str, keep_default_na=False)
-
     mapping = {}
     for col in df.columns:
         key = COLUMN_ALIASES.get(str(col).strip().lower())
@@ -1664,7 +1775,6 @@ def load_products(path: Path) -> list[Product]:
         if required not in mapping:
             sys.exit(f"Ulazna tablica nema stupac '{required}'. "
                      f"Nađeni stupci: {list(df.columns)}")
-
     products = []
     for _, row in df.iterrows():
         naziv = str(row[mapping["naziv"]]).strip()
@@ -1689,12 +1799,6 @@ def write_index(records: list[dict], out_dir: Path) -> tuple[Path, Path]:
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="PDP indeks")
-        ws = writer.sheets["PDP indeks"]
-        widths = {"A": 16, "B": 14, "C": 10, "D": 42, "E": 44, "F": 22, "G": 18,
-                  "H": 9, "I": 22, "J": 50, "K": 10, "L": 60, "M": 34, "N": 34,
-                  "O": 50, "P": 28}
-        for col, width in widths.items():
-            ws.column_dimensions[col].width = width
     return xlsx_path, csv_path
 
 
@@ -1716,30 +1820,25 @@ def load_done(path: Path) -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main (samostalno pokretanje, samo PDP)
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Generator PDP opisa (Bedrock, 2 agenta).")
+    ap = argparse.ArgumentParser(description="Generator PDP opisa (template ver.11).")
     ap.add_argument("--input", "-i", required=True, help="XLSX ili CSV s proizvodima")
     ap.add_argument("--output", "-o", default="out_pdp", help="izlazna mapa")
-    ap.add_argument("--limit", type=int, default=0, help="obradi samo prvih N")
-    ap.add_argument("--sku", action="append", default=[],
-                    help="obradi samo ovaj SKU (može više puta)")
-    ap.add_argument("--max-attempts", type=int, default=3, help="pokušaja po proizvodu")
-    ap.add_argument("--search-results", type=int, default=3,
-                    help="broj web izvora po proizvodu (uz stranicu proizvoda)")
-    ap.add_argument("--no-web-search", action="store_true", help="bez web pretrage")
-    ap.add_argument("--no-fetch", action="store_true",
-                    help="bez dohvaćanja stranice proizvoda i weba")
-    ap.add_argument("--no-verify", action="store_true",
-                    help="preskoči drugog agenta (kontrolora činjenica)")
-    ap.add_argument("--refresh-cache", action="store_true", help="ponovno dohvati izvore")
-    ap.add_argument("--force", action="store_true", help="ignoriraj postojeće rezultate")
-    ap.add_argument("--retry-review", action="store_true",
-                    help="ponovno generiraj samo retke koji nisu OK")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="bez Bedrocka: skupi izvore i ispiši prompt za 1. proizvod")
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--sku", action="append", default=[])
+    ap.add_argument("--max-attempts", type=int, default=3)
+    ap.add_argument("--search-results", type=int, default=3)
+    ap.add_argument("--pim-dir", default="", help="mapa s ambalažom / PIM-om (razina 1)")
+    ap.add_argument("--no-web-search", action="store_true")
+    ap.add_argument("--no-fetch", action="store_true")
+    ap.add_argument("--no-verify", action="store_true")
+    ap.add_argument("--refresh-cache", action="store_true")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--retry-review", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
     return ap.parse_args()
 
 
@@ -1750,6 +1849,7 @@ def main() -> None:
     pdp_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = out_dir / ".cache" / "html"
     jsonl_path = out_dir / "results.jsonl"
+    pim_dir = Path(args.pim_dir) if args.pim_dir else None
 
     products = load_products(Path(args.input))
     if args.sku:
@@ -1760,92 +1860,65 @@ def main() -> None:
     if not products:
         sys.exit("Nema proizvoda za obradu.")
 
-    categories = {p.sku: T.category_for(p.sekcija, p.naziv) for p in products}
-    counts: dict[str, int] = {}
-    for cat in categories.values():
-        counts[cat] = counts.get(cat, 0) + 1
-    print(f"Proizvoda za obradu: {len(products)} "
-          f"({', '.join(f'{T.CATEGORY_LABELS[k]}: {v}' for k, v in counts.items())})")
-
-    def get_sources(p: Product) -> list[Source]:
+    def get_sources(p: Product, letter: str) -> list[Source]:
         if args.no_fetch:
             return []
-        return gather_sources(p, categories[p.sku], cache_dir,
-                              refresh=args.refresh_cache,
+        return gather_sources(p, letter, cache_dir, refresh=args.refresh_cache,
                               web_search=not args.no_web_search,
-                              max_web=args.search_results)
+                              max_web=args.search_results, pim_dir=pim_dir)
 
     if args.dry_run:
         p = products[0]
-        cat = categories[p.sku]
-        sources = get_sources(p)
-        print(f"\n--- KATEGORIJA: {T.CATEGORY_LABELS[cat]} | IZVORA: {len(sources)} ---")
+        letter = T.category_for(p.sekcija, p.naziv)
+        sources = get_sources(p, letter)
+        print(f"\n--- {T.label(letter)} | IZVORA: {len(sources)} ---")
         for s in sources:
             print(f"  [{s.sid}] {s.kind}: {s.url} ({len(s.text)} znakova)")
-        print(f"\n--- SYSTEM PROMPT (pisac) ---\n{build_gen_system(cat)}")
-        print(f"\n--- USER MESSAGE ({p.sku}) ---\n"
-              f"{build_gen_user(p, cat, sources)[:4000]}\n[... skraćeno ...]")
+        print(f"\n--- USER MESSAGE ---\n{build_gen_user(p, letter, '', sources)[:5000]}")
         return
 
     config = load_bedrock_config()
     client = BedrockClient(config)
-    print(f"Model (pisac):     {client.model_id}")
-    print(f"Model (kontrolor): {client.verify_model_id}")
-    print(f"Regija:            {config['BEDROCK_AWS_REGION']}\n")
-
     done = {} if args.force else load_done(jsonl_path)
     if args.retry_review:
         done = {k: v for k, v in done.items() if str(v.get("Status", "")).startswith("OK")}
-
     records: dict[str, dict] = dict(done)
     todo = [p for p in products if p.sku not in records]
-    if len(products) - len(todo):
-        print(f"Preskačem {len(products) - len(todo)} već obrađenih "
-              "(results.jsonl; --force za ponovno).")
+    zauzeti: dict[str, list[str]] = {}
 
     from botocore.exceptions import ClientError  # noqa: PLC0415
-
     try:
         for idx, p in enumerate(todo, start=1):
-            cat = categories[p.sku]
-            sources = get_sources(p)
-            result, md = process_product(p, cat, sources, client,
-                                         args.max_attempts,
-                                         do_verify=not args.no_verify)
-
+            letter0 = T.category_for(p.sekcija, p.naziv)
+            sources = get_sources(p, letter0)
+            letter, podvrsta, razlog = klasificiraj(p, sources, client)
+            result, md = process_product(p, letter, sources, client, args.max_attempts,
+                                         do_verify=not args.no_verify, podvrsta=podvrsta,
+                                         zauzeti_poceci=zauzeti.get(letter, []))
+            result.klasifikacija = razlog
+            if result.prva_recenica:
+                zauzeti.setdefault(letter, []).append(pocetak(result.prva_recenica))
             if md.strip():
                 stem = f"PDP_{p.sku}_{slugify(p.naziv)}"
-                md_path = pdp_dir / f"{stem}.md"
-                docx_path = pdp_dir / f"{stem}.docx"
-                md_path.write_text(md, encoding="utf-8")
+                (pdp_dir / f"{stem}.md").write_text(md, encoding="utf-8")
+                result.md_path = str(pdp_dir / f"{stem}.md")
                 try:
-                    md_to_docx(md, docx_path)
-                    result.docx_path = str(docx_path)
+                    md_to_docx(md, pdp_dir / f"{stem}.docx")
+                    result.docx_path = str(pdp_dir / f"{stem}.docx")
                 except Exception as err:  # noqa: BLE001
                     result.notes.append(f"DOCX nije zapisan: {err}")
-                result.md_path = str(md_path)
-
             record = result.to_record()
             records[p.sku] = record
             append_jsonl(jsonl_path, record)
             print(f"[{idx}/{len(todo)}] {p.sku} {p.naziv[:44]:<44} -> "
-                  f"{result.status} (pokušaja: {result.attempts}, "
-                  f"izvora: {len(sources)})")
+                  f"{letter} {result.status} (pokušaja: {result.attempts})")
     except ClientError as err:
         print("\nBedrock greška:\n  " + explain_client_error(err, config))
-        print("Dosad obrađeno je u results.jsonl — ponovno pokretanje nastavlja "
-              "gdje je stalo.")
         sys.exit(1)
 
     ordered = [records[p.sku] for p in products if p.sku in records]
-    xlsx_path, csv_path = write_index(ordered, out_dir)
-
-    ok = sum(1 for r in ordered if str(r.get("Status", "")).startswith("OK"))
-    print(f"\nGotovo: {ok} OK, {len(ordered) - ok} za provjeru.")
-    print(f"PDP datoteke: {pdp_dir}/  (MD + DOCX po proizvodu)")
-    print(f"Indeks: {xlsx_path}\n        {csv_path}")
-    if len(ordered) - ok:
-        print("Retke koji nisu OK regeneriraj s: --retry-review (ili --sku <SKU>).")
+    xlsx_path, _ = write_index(ordered, out_dir)
+    print(f"\nIndeks: {xlsx_path}")
 
 
 if __name__ == "__main__":

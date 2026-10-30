@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Testovi pravila iz dokumenata „Upute za generator“ i „Audit“ (21. 9. 2026.)."""
-import json
+"""Testovi pravila za title/meta i zajedničkih pravila (Upute, Audit, verzije 3 i 4).
+PDP pravila templatea ver.11 testira test_v4.py."""
 import sys
 import threading
 
 import generate_all as A
-import pdp_extract as X
 import pdp_generator as P
 import pdp_templates as T
 import pravila as R
@@ -26,7 +25,9 @@ print("=== Z1. Hijerarhija izvora (allowlist u kodu) ===")
 primjeri = [
     ("https://eljekarna24.hr/proizvod", "Avène", True, "izvor 1"),
     ("https://www.eau-thermale-avene.com.hr/p", "Avène", True, "izvor 2"),
-    ("https://webljekarna.vasezdravlje.com/p", "Avène", True, "izvor 2"),
+    ("https://webljekarna.vasezdravlje.com/p", "Avène", True, "usporedni izvor"),
+    ("https://primapharme.hr/p", "Avène", True, "usporedni izvor"),
+    ("https://www.notino.hr/p", "Avène", True, "usporedni izvor (kozmetika)"),
     ("https://ljekarne.hr/p", "Solgar", False, "druga ljekarna"),
     ("https://ljekarne-plantak.hr/p", "Solgar", False, "druga ljekarna"),
     ("https://onlineljekarna.hr/p", "Solgar", False, "druga ljekarna"),
@@ -62,19 +63,22 @@ check("hvata spominjanje zabranjene trgovine",
 check("brend „Master of Pharmacy“ nije lažna prijava",
       R.nadi_interne_napomene("Master of Pharmacy Broncho Release sirup 150 ml") == [])
 
-cisto = ("| EAN | Unijeti točno prema aktualnoj deklaraciji ili PIM-u. |\n"
-         "| Obvezna provjera prije objave | Naziv, količina i EAN moraju "
-         "odgovarati aktualnoj ambalaži. |")
-check("tekst iz klijentovog predloška smije ostati",
+cisto = ("| [PROVJERITI: Zemlja podrijetla] |  |\n"
+         "| Proizvođač | [PROVJERITI: Fine Foods, Italija] |")
+check("oznaka [PROVJERITI: …] smije ostati",
       R.nadi_interne_napomene(cisto) == [], str(R.nadi_interne_napomene(cisto)))
+check("stari placeholder se hvata",
+      R.nadi_interne_napomene("| EAN | Unijeti točno prema aktualnoj deklaraciji ili PIM-u. |") != [])
 
-print("\n=== Hijerarhija izvora, verzija 3 ===")
-check("prioritet 1 je eljekarna24",
-      R.prioritet_izvora("https://eljekarna24.hr/p", "NAN") == 1)
-check("prioritet 2 je webljekarna.vasezdravlje.com",
-      R.prioritet_izvora("https://webljekarna.vasezdravlje.com/p", "NAN") == 2)
-check("prioritet 3 je službena stranica brenda",
-      R.prioritet_izvora("https://nan.hr/p", "NAN") == 3)
+print("\n=== Razine izvora, template ver.11 ===")
+check("eLjekarna24 je razina 2",
+      R.prioritet_izvora("https://eljekarna24.hr/p", "NAN") == 2)
+check("stranica brenda je razina 2 (ista kao eLjekarna24)",
+      R.prioritet_izvora("https://nan.hr/p", "NAN") == 2)
+check("Vaše zdravlje je usporedni izvor (razina 3)",
+      R.prioritet_izvora("https://webljekarna.vasezdravlje.com/p", "NAN") == 3)
+check("Prima Pharme je usporedni izvor (razina 3)",
+      R.prioritet_izvora("https://primapharme.hr/p", "NAN") == 3)
 check("ostale ljekarne i dalje zabranjene",
       R.prioritet_izvora("https://ljekarne.hr/p", "NAN") == 0)
 
@@ -88,8 +92,10 @@ check("6–12 mjeseci ostaje", "6–12" in R.ukloni_crtice("Za dob 6–12 mjesec
 check("crtica u nazivu ostaje", "La Roche-Posay" in
       R.ukloni_crtice("La Roche-Posay Effaclar — krema"))
 check("struktura Markdowna ostaje",
-      len(P.parse_headings(R.ukloni_crtice(T.EXAMPLES["cosmetics"]))) ==
-      len(P.parse_headings(T.EXAMPLES["cosmetics"])))
+      len(P.parse_headings(R.ukloni_crtice(T.primjer_za("C")))) ==
+      len(P.parse_headings(T.primjer_za("C"))))
+check("podredak nutritivne tablice (| – od kojih …) ostaje",
+      "| – od kojih šećeri | 7,6 g |" in R.ukloni_crtice("| – od kojih šećeri | 7,6 g |"))
 check("detekcija crtica", R.nadi_crtice("a – b") and not R.nadi_crtice("22–42"))
 
 print("\n=== Title: skraćivanje po segmentima ===")
@@ -184,83 +190,14 @@ res = S.process_product(PROD, S.PageData(fetched=False), None, set(), set(),
                         threading.Lock(), 1)
 check("bez stranice eljekarna24 status je GREŠKA", res.status == "GREŠKA")
 
-print("\n=== PDP: nova pravila ===")
-
-PPROD = P.Product("Kozmetika", "La Roche-Posay", "C2",
-                  "LRP EFFACLAR DUO+M 40 ML", "https://eljekarna24.hr/y/")
-SRC = [P.Source("S1", "stranica proizvoda", PPROD.url, "t",
-                "EAN 3337875863377, niacinamid, glicerin, Zinc PCA, salicilna "
-                "kiselina, 40 ml, 66 % manje mitesera nakon 4 tjedna na 45 "
-                "ispitanika klinička procjena, 44 % na 45 ispitanika, 45 % na 42 "
-                "ispitanika, 24 sata hidratacije na 24 ispitanika instrumentalno "
-                "mjerenje")]
-
-check("brza traka ima šest polja", len(T.BRZA_TRAKA_POLJA) == 6)
-check("primjeri imaju popunjenu brzu traku",
-      all("| Tip proizvoda |" in T.EXAMPLES[c] for c in T.EXAMPLES))
-check("primjeri bez uputa iz predloška",
-      all(not R.nadi_interne_napomene(T.EXAMPLES[c]) for c in T.EXAMPLES))
-check("primjeri bez crtica",
-      all(not R.nadi_crtice(T.EXAMPLES[c]) for c in T.EXAMPLES))
-
-errs = P.validate_pdp(T.EXAMPLES["cosmetics"], PPROD, "cosmetics", SRC)
-check("kanonski primjer prolazi nova pravila", errs == [], str(errs[:3]))
-
-# nepopunjena brza traka
-lose = T.EXAMPLES["cosmetics"].replace("| Namjena | njega masne kože sklone nepravilnostima |",
-                                       "| Namjena |  |")
-check("prazno polje brze trake se hvata",
-      any("nije popunjeno" in e for e in P.validate_pdp(lose, PPROD, "cosmetics", SRC)))
-
-# previše istaknutih sastojaka
-redak = "| Dodatni sastojak | opis |\n"
-lose2 = T.EXAMPLES["cosmetics"].replace(
-    "| Salicilna kiselina | Sastojak koji se često nalazi u njezi kože sklone začepljenim porama. |",
-    "| Salicilna kiselina | Sastojak koji se često nalazi u njezi kože sklone začepljenim porama. |\n"
-    + redak * 3)
-check("više od 4 istaknuta sastojka se hvata",
-      any("3 ili 4" in e for e in P.validate_pdp(lose2, PPROD, "cosmetics", SRC)))
-
-# kliničke studije bez metode
-lose3 = T.EXAMPLES["cosmetics"].replace(
-    "| 24 sata hidratacije | Instrumentalno mjerenje na 24 ispitanika. |",
-    "| 24 sata hidratacije | Podaci nisu navedeni u dostupnom izvoru. |")
-check("redak studija bez metode se hvata",
-      any("Kliničke studije" in e for e in P.validate_pdp(lose3, PPROD, "cosmetics", SRC)))
-
-# testirano bez objašnjenja
-lose4 = T.EXAMPLES["cosmetics"].replace("### Tab 3: Kako se koristi?",
-                                        "Formula je klinički testirana.\n\n### Tab 3: Kako se koristi?")
-check("„klinički testirana“ bez objašnjenja se hvata",
-      any("bez objašnjenja" in e for e in P.validate_pdp(lose4, PPROD, "cosmetics", SRC)))
-
-# interne napomene u tekstu
-lose5 = T.EXAMPLES["cosmetics"].replace("### Tab 4: Sastojci",
-                                        "KONFLIKT: [S2] navodi drugu vrijednost, potvrditi.\n\n### Tab 4: Sastojci")
-errs5 = P.validate_pdp(lose5, PPROD, "cosmetics", SRC)
-check("interne napomene u PDP-u se hvataju",
-      any("Interna napomena" in e for e in errs5))
-
-# crtice
-lose6 = T.EXAMPLES["cosmetics"].replace("Krema za svakodnevnu njegu",
-                                        "Krema — za svakodnevnu njegu")
-check("crtica u PDP-u se hvata",
-      any("crtica" in e.lower() for e in P.validate_pdp(lose6, PPROD, "cosmetics", SRC)))
-
-print("\n=== Odvajanje internog JSON-a od dokumenta ===")
-odgovor = T.EXAMPLES["cosmetics"] + '\n\n```json\n{"nedostaje": ["EAN"], ' \
-          '"konflikti": ["doza"], "koristeni_izvori": ["S1"]}\n```'
-doc, js = P.odvoji_json_blok(odgovor)
-check("JSON odvojen od dokumenta", "```json" not in doc and js.get("nedostaje") == ["EAN"])
-check("dokument ostaje potpun", len(P.parse_headings(doc)) == len(P.parse_headings(T.EXAMPLES["cosmetics"])))
-
 print("\n=== Izlazne datoteke ===")
 check("klijentski stupci točno prema uputama",
       A.KLIJENT_COLS == ["Sekcija", "Brend", "SKU", "Naziv", "URL", "Title tag",
                          "Title (px)", "Meta opis", "Meta opis (px)"])
 check("interni stupci sadrže tražena polja",
       all(c in A.INTERNI_COLS for c in
-          ("Status", "Izvor – eljekarna24", "Izvor – brend",
+          ("Status", "Template", "Za provjeru (crveno)", "Regulatorno",
+           "Izvor – eljekarna24", "Izvor – brend",
            "Preuzeto s brend stranice", "Nedostaje", "Konflikti",
            "Napomena validatora")))
 check("klijentska datoteka nema internih stupaca",
@@ -298,25 +235,6 @@ k = R.skrati_po_segmentima(t, stane=lambda x: S.text_width_px(x, 20) <= 430,
 check("reže cijelu prijedložnu frazu, ne dio",
       "za suhu" not in k and "50 ml" in k, f"({k})")
 
-# EAN iz inventara automatski ide u Tab 5
-inv_ean = X.parse_inventory(json.dumps({"cinjenice": [
-    {"polje": "identifikatori", "vrijednost": "EAN 3282770149487",
-     "izvor": "[S1]", "status": "FOUND"}]}, ensure_ascii=False), "cosmetics")
-md_ph = T.EXAMPLES["cosmetics"].replace(
-    "| EAN | 3337875863377 |",
-    "| EAN | Unijeti točno prema aktualnoj deklaraciji ili PIM-u. |")
-novi, upisano = P.upisi_ean(md_ph, inv_ean)
-check("EAN iz izvora automatski upisan", upisano and "3282770149487" in novi)
-
-# popis sastojaka: podudaranje po stavkama
-inv_lista = X.parse_inventory(json.dumps({"cinjenice": [
-    {"polje": "aktivni_sastojci",
-     "vrijednost": "Niacinamid, Glicerin (navedeni implicitno kroz opis), Zinc PCA",
-     "izvor": "[S1]", "status": "FOUND"}]}, ensure_ascii=False), "cosmetics")
-check("popis sastojaka se uspoređuje po stavkama",
-      not any(g.startswith("HARD FIELD") for g in
-              X.coverage_check(inv_lista, T.EXAMPLES["cosmetics"])))
-
 # blagi način: nedostatak EAN-a ne obara status
 check("blagi način je zadani", P.STROGI_NACIN is False and S.STROGI_NACIN is False)
 
@@ -331,11 +249,13 @@ check("„akcija“ i „poklon“ uklonjeni",
 check("multipakiranje u formatu 3 × 18",
       "3 × 18 tableta" in R.normaliziraj_multipak("pakiranje 3x18 tableta"))
 
-# SEO t.1 obrnuti redoslijed: nastavak se briše prije kraćenja naziva
+# ver.11 (mijenja v3 t.1): meta title je „[naziv, vrsta, pakiranje] │ eLjekarna24”,
+# pa nastavak ostaje, a skraćuje se naziv (brend, tip, varijanta, količina ostaju)
 dugi = "Avène Sun Krema SPF50 za osjetljivu kožu lica 50 ml"
 puni, px, nap = S.finalize_title(dugi)
-check("nastavak se izostavlja umjesto kraćenja naziva",
-      puni == dugi and px <= 550 and nap, f"({px:.0f} px)")
+check("nastavak ostaje, naziv se skraćuje",
+      puni.endswith("│ eLjekarna24") and px <= 550 and "SPF50" in puni
+      and "50 ml" in puni, f"({puni}, {px:.0f} px)")
 
 # SEO t.2 tip proizvoda zaštićen, bez pridjeva na kraju
 k = R.skrati_po_segmentima(
@@ -380,15 +300,6 @@ check("jačina (100 mcg) nije količina pakiranja",
       str(S.validate_candidate(kand2, prod_k, page_k, set(), set())[:2]))
 check("količina pakiranja se čita ispravno",
       R.kolicina_pakiranja("Solgar Vitamin K1 100 mcg 100 tableta") == "100 tableta")
-
-# PDP t.2 placeholder kad podatak postoji je greška
-inv_doza = X.parse_inventory(json.dumps({"cinjenice": [
-    {"polje": "doza", "vrijednost": "2 kapsule dnevno uz večernji obrok",
-     "izvor": "[S1]", "status": "FOUND"}]}, ensure_ascii=False), "supplement")
-md_ph2 = T.EXAMPLES["supplement"]
-check("placeholder umjesto pronađene doze je greška",
-      any("mora biti upisan" in p for p in
-          X.placeholder_instead_of_value(inv_doza, md_ph2)))
 
 print()
 if FAILURES:

@@ -128,3 +128,93 @@ allowlistom (`pravila.py`, `prioritet_izvora()`).
    redoslijeda (`primijeni_rjecnik()`).
 8. **Status OK samo uz nula napomena validatora.**
 9. Stupac **Nedostaje** popunjava se popisom polja kojih nema u izvorima.
+
+## Verzija 4: PDP templateovi ver.11 i checkliste (listopad 2026.)
+
+Klijent je poslao 10 dokumenata kategorija (11 templateova A–K), tri checkliste
+(dodaci prehrani, biljni dodaci prehrani, dječja hrana i hrana za dojenčad),
+regulatorne dokumente (Uredba 432/2012 s tvrdnjama, Pravilnik NN 160/2013,
+Uredbe 1925/2006 i 2018/848) i dva opisa koja je odobrila stručna provjera
+(Ferozomal, NAN SUPREMEpro 1). Ova verzija zamjenjuje strukturu iz verzija 1–3.
+
+### Gdje su pravila
+- Klijentovi dokumenti su u `predlosci/` kao Markdown i ulaze u prompt
+  **doslovno**: opća pravila, template proizvoda i checklista (checklista ima
+  prednost). Ništa nije prepričano u kodu. Nova verzija templatea:
+  `python alati/uvezi_predloske.py …`, zatim `make test`.
+- `pdp_templates.py` drži samo ono što kod provjerava: nazive i redoslijed
+  tabova, redke tablice podataka, FAQ, tvrdnje i podvrste. `test_v4.py`
+  provjerava da se slažu s klijentovim datotekama.
+- `regulativa.py` + `regulativa/`: tvrdnje iz Uredbe 432/2012, % PU (NRV iz
+  Uredbe 1169/2011), prag „izvor” 15 % NRV-a, najveće doze (NN 160/2013,
+  Prilog I.), izvadci Priloga II. i zabranjene biljke (Prilog III.).
+
+### Odabir templatea
+Dokument kategorije određuje koji su templateovi dopušteni (npr. Bebe, djeca i
+mame: C, B, A, D, J). Klasifikator (poziv modelu) bira template i podvrstu prema
+**deklaraciji** (početna/prijelazna formula, biljni dodatak, K1/K2, H1/H2…).
+Sekcija „Cijeli webshop” smije koristiti sve templateove.
+
+### Izvori (opća pravila, „Izvori podataka i redoslijed”)
+1. HR ambalaža / deklaracija / PIM / uputa: `--pim-dir mapa`, datoteke s SKU-om
+   ili EAN-om u nazivu (.pdf, .docx, .txt, .md, .html).
+2. eLjekarna24 i službena stranica brenda ili HR distributera (ista razina).
+3. Vaše zdravlje i Prima Pharme; za kozmetiku, parfeme i beauty uređaje i Notino,
+   MAKEUP, Douglas: samo za usporedbu, tekst se ne kopira (provjera 8 istih
+   riječi zaredom).
+- eLjekarna24 je BigCommerce: opis se čita iz `.pv-desc-source` (prije se čitao
+  samo meta opis, ~250 znakova po proizvodu), EAN iz polja UPC.
+- Ekstrakcija procjenjuje je li svaki izvor isti proizvod i pakiranje; izvori
+  drugog pakiranja se odbacuju i inventar se ponovno izvlači bez njih.
+
+### Što kod provjerava (validate_pdp)
+SEO elementi (meta title s „ │ eLjekarna24”, meta do ~155 znakova, H1 = naziv,
+bez slogana), prvi ekran (broj rečenica, obrazac prve rečenice prema zadnjoj
+znamenci EAN-a, zabranjeni počeci, „dodatak prehrani” i „sa sladilima”),
+tabovi točno iz templatea, brza traka (3–6 oznaka, bez tvrdnji, % PU i crvenih
+podataka; za početnu formulu samo vrsta, dob, oblik, pakiranje, alergen),
+podnaslovi s podatkom, naziv u Tabu 1 najviše jednom, blok tvrdnji (svaka
+tvrdnja mora biti iz dokumenta tvrdnji za tvar s ispunjenim uvjetom, bez doza),
+„doprinosi” samo u tvrdnjama, bez tvrdnji o apsorpciji i podnošljivosti oblika,
+tablica podataka s točnim redcima, obvezne rečenice, SKU nigdje, FAQ (dopušten,
+broj pitanja, da/ne odgovori, konkretan odgovor), zabranjene fraze i prazni
+glagoli, navođenje izvora, crtice, uskličnici, brojevi kojih nema u izvorima,
+kopiranje s usporednih izvora, kontrola serije (isti počeci prve rečenice).
+Nakon toga **stručna provjera** (drugi agent) dobiva ista pravila, izvore i
+izračune te prijavljuje činjenične, regulatorne i stilske greške.
+
+### Crvena boja
+U Markdownu `[PROVJERITI: podatak]`, u DOCX-u crveni tekst. Samo za konkretan
+podatak: samo kod usporedne ljekarne, neslaganje izvora iste razine (oba
+podatka), obvezan podatak koji nedostaje (prazna ćelija, crveni naziv retka),
+sumnjiv podatak (doza iznad najveće dopuštene, pravopis iz izvora). Popis svih
+oznaka ide u `interno.xlsx`, stupac „Za provjeru (crveno)”.
+
+### Izlaz
+Dokument: SEO elementi, prvi ekran, tabovi, FAQ (ako ga ima) i na kraju
+„Izvori (ne objavljuje se)”: ID | naziv i URL | datum pristupa | što potvrđuje.
+Nema statusa, otvorenih točaka, recenzija ni Taba „Savjet ljekarnika”. Meta
+title i meta description u PDP-u su oni koje je provjerio SEO alat (pikseli).
+
+### Statusi
+| Status | Kada |
+| --- | --- |
+| OK | prošla automatska kontrola i stručna provjera, nema crvenih oznaka |
+| OK, PROVJERITI CRVENO | prošlo sve, ali postoje crveno označeni podaci (provjeriti na ambalaži prije objave) |
+| TREBA PROVJERA | i nakon svih pokušaja ostale su greške (stupac Napomene) |
+| ZAUSTAVLJENO | biljna vrsta s Priloga III. NN 160/2013: opis se ne piše |
+| GREŠKA / GREŠKA EKSTRAKCIJE | stranica eLjekarne24 nije dohvaćena / ekstrakcija nije uspjela |
+
+### Promjene u odnosu na verziju 3
+- Nastavak titla je „ │ eLjekarna24” (U+2502, kako stoji u templateu) umjesto
+  „ | eljekarna24”; nastavak ostaje, a skraćuje se naziv (v3: prvo se brisao
+  nastavak).
+- Ukinuti su placeholderi („Unijeti točno prema aktualnoj deklaraciji ili
+  PIM-u.”), Tab 6, blok recenzija, redak „Obvezna provjera prije objave”,
+  kliničke studije kao zaseban odjeljak i obvezne ograde „prema deklaraciji”
+  (sada su zabranjene kao navođenje izvora).
+- Odobreni primjeri u izlaznom formatu (`predlosci/primjeri/format/`) slijede
+  checklistu tamo gdje se odobreni tekst od nje razlikuje: za Ferozomal su
+  navedene samo tvrdnje relevantne za željezo, dodana je brza traka, prva
+  rečenica prema obrascu iz checkliste, FAQ bez pitanja o trajanju pakiranja i
+  bez popisa „Prije objave provjeriti”.

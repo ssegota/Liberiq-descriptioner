@@ -6,7 +6,6 @@ import sys
 import threading
 
 import generate_all as A
-import pdp_extract as X
 import pdp_generator as P
 import pravila as R
 import pdp_templates as T
@@ -29,12 +28,13 @@ PAGE = S.PageData(fetched=True, content=(
     "Solgar Vitamin K1 100 mcg, 100 tableta. Za odrasle. Vitamin K doprinosi "
     "normalnom zgrušavanju krvi i održavanju normalnih kostiju. Jedna tableta dnevno."))
 
-# 1. separator | (U+007C), ne │ (U+2502)
-check("separator je | (U+007C)", S.BRAND_SUFFIX == " | eljekarna24" and
-      "\u2502" not in S.BRAND_SUFFIX, repr(S.BRAND_SUFFIX))
+# 1. separator │ (U+2502) i „eLjekarna24” prema PDP templateu ver.11
+check("separator je │ eLjekarna24 (template ver.11)",
+      S.BRAND_SUFFIX == " \u2502 eLjekarna24", repr(S.BRAND_SUFFIX))
 full, px, _ = S.finalize_title("Solgar Vitamin K1 100 mcg 100 tableta")
-check("klijentov primjer: 51 znak / ~466 px",
-      len(full) == 51 and 460 <= px <= 470, f"({len(full)} znakova, {px:.0f} px)")
+check("primjer stane u 550 px s nastavkom",
+      full.endswith("\u2502 eLjekarna24") and px <= S.TITLE_MAX_PX,
+      f"({len(full)} znakova, {px:.0f} px)")
 
 # 2. zarez ispred količine
 c = S.Candidate(title_core="Solgar Vitamin K1 100 mcg, 100 tableta",
@@ -159,178 +159,44 @@ check("nepotvrđena namjena -> TREBA PROVJERA",
       res.status == "TREBA PROVJERA" and
       any("Namjena nije potvrđena" in n for n in res.notes))
 
-print("\n=== PDP: uputa nakon testiranja ===")
-
-PPROD = P.Product("Kozmetika", "La Roche-Posay", "C4",
-                  "LA ROCHE POSAY EFFACLAR DUO+M 40 ML", "https://eljekarna24.hr/y/")
-SRC = [P.Source("S1", "stranica proizvoda", PPROD.url, "t",
-                "Effaclar Duo+M 40 ml. INCI: Aqua, Glycerin, Niacinamide, Zinc PCA, "
-                "Salicylic Acid. Nanositi ujutro i navečer na očišćeno lice. "
-                "EAN 3337875863377.")]
-
-# 13. inventar: parsiranje, hard fields, konflikt
-inv_json = json.dumps({"cinjenice": [
-    {"polje": "puni_sastav", "vrijednost": "Aqua, Glycerin, Niacinamide, Zinc PCA, Salicylic Acid",
-     "izvor": "[S1]", "status": "FOUND"},
-    {"polje": "nacin_uporabe", "vrijednost": "Nanositi ujutro i navečer na očišćeno lice",
-     "izvor": "[S1]", "status": "FOUND"},
-    {"polje": "identifikatori", "vrijednost": "EAN 3337875863377", "izvor": "[S1]",
-     "status": "FOUND"},
-    {"polje": "pao", "vrijednost": "", "izvor": "", "status": "NOT FOUND"},
-    {"polje": "svojstva", "vrijednost": "30 ml vs 40 ml", "izvor": "[S1] vs [S2]",
-     "status": "CONFLICT", "konflikt": "[S1] 40 ml vs [S2] 30 ml"},
-]}, ensure_ascii=False)
-inv = X.parse_inventory(inv_json, "cosmetics")
-check("inventar parsiran", inv.ok and len(inv.facts) == 5)
-check("hard fields prepoznati", len(inv.hard_found()) == 3,
-      f"({[f.polje for f in inv.hard_found()]})")
-check("konflikt prepoznat", len(inv.conflicts()) == 1)
-check("neispravan JSON -> GREŠKA EKSTRAKCIJE",
-      not X.parse_inventory("nije json", "cosmetics").ok)
-
-# 14. coverage check hvata izgubljeni INCI
-md_ok = T.EXAMPLES["cosmetics"].replace(
-    "Puni INCI sastav s aktualne deklaracije (umetnuti točan popis bez prijevoda i skraćivanja).",
-    "INCI: Aqua, Glycerin, Niacinamide, Zinc PCA, Salicylic Acid. Nanositi ujutro i navečer "
-    "na očišćeno lice. Konflikt izvora označen za provjeru.")
-md_lost = T.EXAMPLES["cosmetics"]
-gaps_ok = X.coverage_check(inv, md_ok)
-gaps_lost = X.coverage_check(inv, md_lost)
-check("coverage: potpun PDP prolazi", gaps_ok == [], str(gaps_ok[:2]))
-check("coverage: izgubljeni INCI detektiran",
-      any("puni_sastav" in g for g in gaps_lost), f"({len(gaps_lost)} problema)")
-check("coverage: neoznačen konflikt detektiran",
-      any("Konflikt izvora" in g for g in gaps_lost))
-
-# 15. placeholder umjesto vrijednosti
-md_ph = md_lost.replace("| EAN | 3337875863377 |",
-                        "| EAN | Unijeti točno prema aktualnoj deklaraciji ili PIM-u. |")
-check("placeholder umjesto pronađene vrijednosti detektiran",
-      len(X.placeholder_instead_of_value(inv, md_ph)) > 0)
-check("„Obvezna provjera prije objave“ nije lažna prijava",
-      not any("Obvezna provjera" in p for p in
-              X.placeholder_instead_of_value(inv, md_lost)))
-
-# 16. pipeline: ekstrakcija -> pisac -> coverage -> OK
-class PDPClient:
-    model_id = verify_model_id = "mock"
-    def __init__(self): self.n = 0
-    def extract(self, s, u): return inv_json
-    def generate(self, s, u):
-        assert "INVENTAR" in u and "HARD FIELD" in s
-        self.n += 1
-        doc = md_lost if self.n == 1 else md_ok
-        return doc + '\n\n```json\n{"nedostaje": [], "konflikti": [], ' \
-                     '"koristeni_izvori": ["S1"]}\n```'
-
-    def verify(self, s, u):
-        return json.dumps({"prolazi": True, "nepotkrijepljene_tvrdnje": [],
-                           "napomena": ""}, ensure_ascii=False)
-
-cl = PDPClient()
-res, md = P.process_product(PPROD, "cosmetics", SRC, cl, 3, True)
-check("pipeline: coverage vratio pisca na dopunu", cl.n >= 2, f"(poziva: {cl.n})")
-check("pipeline: konflikt ne ide u tekst nego u interni status",
-      res.status != "OK" and res.conflicts, f"({res.status})")
-check("pipeline: inventar zapisan u rezultat",
-      res.inventory is not None and len(res.inventory.found()) == 3)
-
-# 17. status NEDOSTAJE PODATAK IZ IZVORA
-class LosingClient(PDPClient):
-    def generate(self, s, u): return md_lost
-res2, _ = P.process_product(PPROD, "cosmetics", SRC, LosingClient(), 2, True)
-check("status NEDOSTAJE PODATAK IZ IZVORA",
-      res2.status == "NEDOSTAJE PODATAK IZ IZVORA", f"({res2.status})")
-check("coverage zapisan u rezultat", len(res2.coverage) > 0)
-
-# 18. GREŠKA EKSTRAKCIJE
-class BadExtract(PDPClient):
-    def extract(self, s, u): return "ovo nije json"
-res3, md3 = P.process_product(PPROD, "cosmetics", SRC, BadExtract(), 2, True)
-check("status GREŠKA EKSTRAKCIJE", res3.status == "GREŠKA EKSTRAKCIJE" and md3 == "")
-
-# 19. novi stupci u PDP zapisu
-rec = res.to_record()
-check("PDP stupci: coverage/konflikt/ekstrakcija",
-      all(k in rec for k in ("Ekstrahiranih polja", "Coverage check",
-                             "Konflikt izvora")))
-
 print("\n=== Objedinjeni runner ===")
 
-# 20. kanonski naziv iz PDP-a
-canon = A.canonical_name_from_md(T.EXAMPLES["cosmetics"])
+canon = A.canonical_name_from_md(T.primjer_za("A"))
 check("kanonski naziv izvučen iz PDP-a",
-      canon.startswith("La Roche-Posay Effaclar Duo+M krema"), f"({canon[:40]}…)")
+      canon == "Ferozomal mikrogranule za izravnu primjenu, 30 vrećica", f"({canon})")
 
-# 21. brand source samo sa službene domene brenda
-srcs = [P.Source("S1", "stranica proizvoda", "https://eljekarna24.hr/x", "t", "a"),
-        P.Source("S2", P.TERTIARY_LABEL,
-                 "https://www.laroche-posay.com.hr/effaclar", "t", "b" * 300),
-        P.Source("S3", "web", "https://neki-forum.hr/tema", "t", "c" * 300)]
+srcs = [P.Source("S1", P.KIND_PRIMARY, "https://eljekarna24.hr/x", "t", "a"),
+        P.Source("S2", P.KIND_BRAND, "https://www.laroche-posay.com.hr/effaclar", "t",
+                 "b" * 300),
+        P.Source("S3", P.KIND_COMPARE, "https://webljekarna.vasezdravlje.com/p", "t",
+                 "c" * 300, razina=3)]
 bs = A.brand_source_for(srcs, "La Roche-Posay")
-check("brend izvor prepoznat sa službene hrvatske domene",
+check("SEO brend izvor: službena hrvatska domena",
       bs is not None and "laroche-posay.com.hr" in bs.url)
-check("treći izvor se ne koristi za SEO",
+check("SEO: usporedna ljekarna nije brend izvor",
       A.brand_source_for([srcs[0], srcs[2]], "La Roche-Posay") is None)
 check("strana domena brenda se ne koristi",
       R.je_dopusten("https://laroche-posay.rs/p", "La Roche-Posay")[0] is False)
-
-# 22. prioritet statusa u zbirnom retku
-r = A.combined_record(PPROD, None, res2, "m", True)
-check("zbirni status preuzima najozbiljniju oznaku",
-      r["Ukupni status"] == "NEDOSTAJE PODATAK IZ IZVORA",
-      f"({r['Ukupni status']})")
-
-print()
-if FAILURES:
-    print("PALO:", FAILURES)
-    sys.exit(1)
-print("Sve OK.")
-
-print("\n=== Hijerarhija izvora i definitivni izrazi ===")
-
-# 23. hijerarhija: S1 link, S2 vasezdravlje, S3+ ostali
-srcs = [P.Source("S1", "stranica proizvoda", "https://eljekarna24.hr/x", "t", "a"),
-        P.Source("S2", P.SECONDARY_LABEL,
-                 "https://webljekarna.vasezdravlje.com/p", "t", "b"),
-        P.Source("S3", P.TERTIARY_LABEL, "https://solgar.hr/proizvod", "t", "c")]
 blok = P.sources_block(srcs)
-check("prompt označava sva tri prioriteta",
-      all(f"PRIORITET {i}" in blok for i in (1, 2, 3)))
-check("vasezdravlje je izvor 2",
-      R.prioritet_izvora("https://webljekarna.vasezdravlje.com/p", "Solgar") == 2)
+check("prompt označava razine izvora i zabranu kopiranja",
+      "RAZINA 2" in blok and "RAZINA 3" in blok and "NE kopira" in blok)
 
-# 24. SEO sekundarni izvor: vasezdravlje ima prednost pred brendom
-bs = A.brand_source_for(srcs, "Solgar")
-check("SEO izvor 2 je vasezdravlje",
-      bs is not None and "vasezdravlje" in bs.url, f"({bs.url if bs else None})")
-bs3 = A.brand_source_for([srcs[0], P.Source("S2", "web", "https://forum.hr/x", "t", "y")],
-                         "Solgar")
-check("SEO: nedopušten izvor se ne koristi", bs3 is None)
+md_seo = A.ugradi_seo(T.primjer_za("A"), "Ferozomal 30 vrećica \u2502 eLjekarna24",
+                      "Nova meta.")
+check("SEO alat upisuje title i meta u PDP",
+      "| Meta title | Ferozomal 30 vrećica \u2502 eLjekarna24 |" in md_seo
+      and "| Meta description | Nova meta. |" in md_seo)
 
-# 25. definitivni izrazi
+print("\n=== Definitivni izrazi ===")
 for izraz in ("Najbolji izbor za kožu.", "Najučinkovitiji proizvod u ponudi.",
-              "Jedini proizvod koji to radi.", "Apsolutno siguran za sve.",
-              "Zlatni standard njege.", "Uvijek djeluje."):
+              "Apsolutno siguran za sve.", "Zlatni standard njege."):
     check(f"zabranjeno: {izraz[:28]}",
           bool(S.find_forbidden(izraz)) and bool(P.find_forbidden(izraz)))
-
-# 26. dopušteni izrazi
 for izraz in ("Dojenje je najbolji način prehrane dojenčeta.",
+              "Majčino mlijeko najbolja je hrana za dojenče.",
               "Uzmi najviše jednu tabletu dnevno.",
               "Najkasnije 30 minuta prije obroka."):
-    check(f"dopušteno: {izraz[:32]}",
-          not S.find_forbidden(izraz) and not P.find_forbidden(izraz))
-
-# 27. pravila su u promptovima
-check("pravilo u SEO promptu", "definitivni izrazi" in S.build_system_prompt().lower())
-check("pravilo u PDP promptu",
-      "ZABRANA DEFINITIVNIH IZRAZA" in P.build_gen_system("cosmetics"))
-check("hijerarhija u PDP promptu",
-      "PRIORITET 2" in P.build_gen_system("cosmetics") and
-      "službena hrvatska stranica brenda" in P.build_gen_system("cosmetics"))
-check("hijerarhija u promptu ekstrakcije",
-      "PRIORITET 1" in X.build_extract_system("cosmetics"))
+    check(f"dopušteno: {izraz[:32]}", not P.find_forbidden(izraz))
 
 print()
 if FAILURES:

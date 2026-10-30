@@ -25,6 +25,16 @@ from urllib.parse import urlparse
 PRIMARNA_DOMENA = "eljekarna24.hr"
 SEKUNDARNA_DOMENA = "webljekarna.vasezdravlje.com"
 
+# Razina 3 (template ver.11): samo za usporedbu podataka, tekst se ne kopira.
+USPOREDNE_DOMENE = ("webljekarna.vasezdravlje.com", "primapharme.hr")
+# Za kozmetiku, parfeme i beauty uređaje i ovi webshopovi (podaci o teksturi,
+# mirisu, načinu uporabe; tekst se ne kopira).
+USPOREDNE_DOMENE_KOZMETIKA = ("notino.hr", "makeup.hr", "douglas.hr")
+
+# Nazivi trgovina koji se ne smiju pojaviti u javnom tekstu.
+NAZIVI_TRGOVINA = ("vaše zdravlje", "vase zdravlje", "prima pharme", "notino",
+                   "makeup.hr", "douglas", "phama", "ljekarna.online")
+
 # Službene hrvatske stranice brendova. Popis održava tim, ne model.
 # Ključ je normalizirani naziv brenda iz ulazne tablice.
 BREND_DOMENE: dict[str, tuple[str, ...]] = {
@@ -55,7 +65,9 @@ ZABRANJENE_DOMENE = (
 )
 
 # Nastavci koji označavaju stranicu brenda za drugo tržište.
-STRANA_TRZISTA = (".rs", ".us", ".co.uk", ".in", ".sa", ".au", ".de", ".fr",
+STRANA_TRZISTA = (".mk", ".me", ".ro", ".hu", ".at", ".cz", ".sk", ".bg", ".gr",
+                  ".es", ".nl", ".be", ".ch", ".ua",
+                  ".rs", ".us", ".co.uk", ".in", ".sa", ".au", ".de", ".fr",
                   ".it", ".si", ".ba", ".com.tr", ".ru", ".pl")
 
 
@@ -72,26 +84,55 @@ def _norm_brend(brend: str) -> str:
                   .encode("ascii", "ignore").decode())
 
 
-def dopustene_domene(brend: str) -> tuple[str, ...]:
-    """Hijerarhija izvora (klijent, verzija 3):
-       1. eljekarna24.hr
-       2. webljekarna.vasezdravlje.com
-       3. službena hrvatska stranica brenda
+def dopustene_domene(brend: str, kozmetika: bool = False) -> tuple[str, ...]:
+    """Izvori prema općim pravilima PDP templatea (ver.11):
+       1. HR ambalaža / deklaracija / PIM (lokalne datoteke, nisu URL),
+       2. eljekarna24.hr i službena stranica brenda ili HR distributera,
+       3. Vaše zdravlje i Prima Pharme (za kozmetiku i Notino, MAKEUP,
+          Douglas) — samo za usporedbu.
     Sve ostalo se odbacuje."""
-    return ((PRIMARNA_DOMENA, SEKUNDARNA_DOMENA)
-            + BREND_DOMENE.get(_norm_brend(brend), ()))
+    return ((PRIMARNA_DOMENA,) + BREND_DOMENE.get(_norm_brend(brend), ())
+            + USPOREDNE_DOMENE
+            + (USPOREDNE_DOMENE_KOZMETIKA if kozmetika else ()))
+
+
+def je_stranica_brenda(url: str, brend: str) -> bool:
+    """Službena stranica brenda: domena s popisa ili domena koja sadrži naziv
+    brenda (npr. laroche-posay.com.hr), bez stranica za druga tržišta."""
+    host = _host(url)
+    if not host:
+        return False
+    for d in BREND_DOMENE.get(_norm_brend(brend), ()):
+        if host == d or host.endswith("." + d):
+            return True
+    token = _norm_brend(brend)
+    if len(token) < 4 or any(host.endswith(n) for n in STRANA_TRZISTA):
+        return False
+    # laroche-posay-me.com, brand-rs.com: stranica za drugo tržište
+    if re.search(r"-(?!hr$)[a-z]{2}$", host.split(".")[0]):
+        return False
+    if any(host == z or host.endswith("." + z) for z in ZABRANJENE_DOMENE):
+        return False
+    return token in re.sub(r"[^a-z0-9]", "", host.split(".")[0] if host.count(".") <= 1
+                           else "".join(host.split(".")[:-1]))
+
+
+def je_usporedni(url: str) -> bool:
+    host = _host(url)
+    return any(host == d or host.endswith("." + d)
+               for d in USPOREDNE_DOMENE + USPOREDNE_DOMENE_KOZMETIKA)
 
 
 def prioritet_izvora(url: str, brend: str = "") -> int:
-    """1, 2 ili 3 prema hijerarhiji; 0 ako izvor nije dopušten."""
+    """Razina izvora: 2 (eLjekarna24, brend), 3 (usporedni); 0 = nije dopušten.
+    Razina 1 su lokalne datoteke (PIM, deklaracija), koje nemaju URL."""
     host = _host(url)
     if host.endswith(PRIMARNA_DOMENA):
-        return 1
-    if host.endswith(SEKUNDARNA_DOMENA):
         return 2
-    for d in BREND_DOMENE.get(_norm_brend(brend), ()):
-        if host == d or host.endswith("." + d):
-            return 3
+    if je_stranica_brenda(url, brend):
+        return 2
+    if je_usporedni(url):
+        return 3
     return 0
 
 
@@ -99,7 +140,7 @@ def je_primarni(url: str) -> bool:
     return _host(url).endswith(PRIMARNA_DOMENA)
 
 
-def je_dopusten(url: str, brend: str) -> tuple[bool, str]:
+def je_dopusten(url: str, brend: str, kozmetika: bool = True) -> tuple[bool, str]:
     """Vrati (dopušteno, razlog). Sve izvan allowliste se odbacuje."""
     host = _host(url)
     if not host:
@@ -107,7 +148,9 @@ def je_dopusten(url: str, brend: str) -> tuple[bool, str]:
     for zabranjena in ZABRANJENE_DOMENE:
         if host == zabranjena or host.endswith("." + zabranjena):
             return False, f"zabranjena domena ({host})"
-    for dopustena in dopustene_domene(brend):
+    if je_stranica_brenda(url, brend):
+        return True, "službena stranica brenda"
+    for dopustena in dopustene_domene(brend, kozmetika):
         if host == dopustena or host.endswith("." + dopustena):
             return True, "dopušteno"
     if any(host.endswith(nastavak) for nastavak in STRANA_TRZISTA):
@@ -198,11 +241,17 @@ EN_DASH, EM_DASH = "\u2013", "\u2014"
 RASPON_RE = re.compile(rf"(?<=\d)\s*[{EN_DASH}{EM_DASH}]\s*(?=\d)")
 
 
+PODREDAK_RE = re.compile(rf"(\|\s*)[{EN_DASH}{EM_DASH}]\s+")
+
+
 def _ukloni_crtice_redak(redak: str) -> str:
-    cuvaj = "\x00"
-    out = RASPON_RE.sub(cuvaj, redak)                       # sakrij raspone brojeva
+    cuvaj, podredak = "\x00", "\x01"
+    # „| – od kojih šećeri |”: podredak nutritivne tablice prepisan s deklaracije
+    out = PODREDAK_RE.sub(lambda m: m.group(1) + podredak, redak)
+    out = RASPON_RE.sub(cuvaj, out)                         # sakrij raspone brojeva
     out = re.sub(rf"\s*[{EN_DASH}{EM_DASH}]\s*", ", ", out)  # crtica -> zarez
     out = out.replace(cuvaj, EN_DASH)                       # vrati raspone
+    out = out.replace(podredak, EN_DASH + " ")
     out = re.sub(r",\s*,", ",", out)
     out = re.sub(r",\s*([.!?;:])", r"\1", out)
     out = re.sub(r"(?<=[.!?])\s*,\s+", " ", out)
@@ -226,7 +275,7 @@ def ukloni_crtice(tekst: str) -> str:
 
 def nadi_crtice(tekst: str) -> list[str]:
     """Crtice koje nisu dopušteni raspon brojeva."""
-    ocisceno = RASPON_RE.sub(" ", tekst or "")
+    ocisceno = RASPON_RE.sub(" ", PODREDAK_RE.sub(r"\1", tekst or ""))
     return [m.group(0) for m in re.finditer(rf"[{EN_DASH}{EM_DASH}]", ocisceno)]
 
 
@@ -245,30 +294,31 @@ INTERNI_UZORCI: list[tuple[re.Pattern, str]] = [
     (re.compile(r"Prije lokalne objave", re.IGNORECASE), "interna uputa"),
     (re.compile(r"prema dostupnoj dokumentaciji", re.IGNORECASE), "interna uputa"),
     (re.compile(r"za internu provjeru", re.IGNORECASE), "interna oznaka"),
-    (re.compile(r"tip,\s*namjena,\s*ciljana skupina", re.IGNORECASE),
-     "uputa iz predloška umjesto popunjenih brzih podataka"),
     (re.compile(r"\bizvor(i|a)?\s*:\s*\[?S\d", re.IGNORECASE), "popis izvora"),
+    # template ver.11: nema statusa ni otvorenih točaka u dokumentu
+    (re.compile(r"Prije objave provjerit\w*", re.IGNORECASE), "popis otvorenih točaka"),
+    (re.compile(r"\bstatus\s*:", re.IGNORECASE), "status u dokumentu"),
+    # „Opis je opis, a ne navođenje izvora”
+    (re.compile(r"\bprema (proizvođač\w*|deklaracij\w*|podacima\w*|uputi proizvođača|"
+                r"navodima)", re.IGNORECASE), "navođenje izvora u javnom tekstu"),
+    (re.compile(r"\bproizvođač navodi\b", re.IGNORECASE), "navođenje izvora u javnom tekstu"),
+    (re.compile(r"\bna pakiranju piše\b", re.IGNORECASE), "navođenje izvora u javnom tekstu"),
+    (re.compile(r"\bnavodi se\b", re.IGNORECASE), "navođenje izvora u javnom tekstu"),
+    (re.compile(r"\bpodatak nije dostupan\b|\bnije navedeno\b|\bnije pronađen\w*",
+                re.IGNORECASE), "„podatak nije dostupan” u javnom tekstu"),
+    (re.compile(r"\bnije označen\w* kao\b|\bna pakiranju ne piše\b", re.IGNORECASE),
+     "odgovor koji opisuje oznaku umjesto podatka"),
+    (re.compile(r"Unijeti točno prema aktualnoj deklaraciji", re.IGNORECASE),
+     "stari placeholder (ukinut u ver.11)"),
 ]
 
-# Tekst iz klijentovih predložaka koji SMIJE ostati.
-DOZVOLJENI_PREDLOSCI = (
-    "Prije uporabe provjeri aktualni sastav na pakiranju.",
-    "Prije uporabe provjerite sve alergene na aktualnoj deklaraciji.",
-    "Provjerite odgovara li priložena manšeta opsegu nadlaktice korisnika.",
-    "Unijeti točno prema aktualnoj deklaraciji ili PIM-u.",
-    "Navesti samo ako je potvrđena na deklaraciji ili u dokumentaciji točnog proizvoda.",
-    "Obvezna provjera prije objave",
-    "[Dopuniti iskustvima iz prakse ljekarnika eLjekarna24 prije objave.]",
-    "[Blok se puni automatski iz sustava recenzija.]",
-    "Puni INCI sastav s aktualne deklaracije (umetnuti točan popis bez prijevoda i skraćivanja).",
-)
+# [PROVJERITI: …] je oznaka neprovjerenog podatka iz templatea (crvena boja
+# u DOCX-u), a ne interna napomena.
+PROVJERITI_RE = re.compile(r"\[PROVJERITI(?::\s*([^\]]*))?\]")
 
 
 def _bez_dozvoljenih(tekst: str) -> str:
-    out = tekst or ""
-    for dozvoljeno in DOZVOLJENI_PREDLOSCI:
-        out = out.replace(dozvoljeno, " ")
-    return out
+    return PROVJERITI_RE.sub(lambda m: " " + (m.group(1) or "") + " ", tekst or "")
 
 
 def nadi_interne_napomene(tekst: str) -> list[str]:
@@ -280,6 +330,10 @@ def nadi_interne_napomene(tekst: str) -> list[str]:
         if m:
             nalazi.append(f"„{m.group(0).strip()}“ ({opis})")
     nisko = provjera.lower()
+    for naziv in NAZIVI_TRGOVINA:
+        if re.search(rf"\b{re.escape(naziv)}\b", nisko):
+            nalazi.append(f"spominjanje druge trgovine ({naziv})")
+            break
     for domena in ZABRANJENE_DOMENE:
         # traži se PUNA domena (pharmacy.hr), ne dio riječi, da brend
         # „Master of Pharmacy“ ne bi bio prepoznat kao druga ljekarna
@@ -307,11 +361,38 @@ ZABRANJENE_RIJECI = [
     (r"\bnajucinkovitij\w*", "najučinkovitiji"),
     (r"\bklinicki dokazano\b", "klinički dokazano"),
     (r"\bzlatni standard\b", "zlatni standard"),
+    # template ver.11, „Pravila pisanja za kupca”: fraze
+    (r"\botkrijte\b", "otkrijte"), (r"\bsavrsen izbor\b", "savršen izbor"),
+    (r"\bvas saveznik\b", "vaš saveznik"),
+    (r"\bdanasnjem uzurbanom svijetu\b", "u današnjem užurbanom svijetu"),
+    (r"\bkljuc zdravlja\b", "ključ zdravlja"),
+    (r"\bprirodna podrska\b", "prirodna podrška"),
+    (r"\brevolucionar\w*", "revolucionarno"), (r"\binovativn\w*", "inovativno"),
+    (r"\buzivajte u\b", "uživajte u"),
+    (r"\bpogodan za svakodnevnu upotrebu\b", "pogodan za svakodnevnu upotrebu"),
+    (r"\bjednostavan za uporabu\b", "jednostavan za uporabu"),
+    (r"\bprakticno rjesenje\b", "praktično rješenje"),
+    (r"\bvazno je napomenuti\b", "važno je napomenuti"),
+    (r"\bosim toga\b", "osim toga"), (r"\bkada je rijec o\b", "kada je riječ o"),
+    (r"\bzahvaljujuci\b", "zahvaljujući"),
+    # glagoli bez sadržaja („doprinosi” je dopušten samo u tvrdnjama)
+    (r"\bpruza\w*", "pruža"), (r"\bomogucuj\w*|\bomogucava\w*", "omogućuje"),
+    (r"\bosigurava\w*", "osigurava"), (r"\bpodrzava\w*", "podržava"),
+    (r"\bnudi\b", "nudi"),
+]
+# Medicinski rječnik: zabranjen osim kod lijekova (Template K).
+MEDICINSKE_RIJECI = [
+    (r"\blijec\w*", "liječi"), (r"\bizlijec\w*", "izliječi"),
+    (r"\bublazava\w*", "ublažava"), (r"\bterapij\w*", "terapija"),
+    (r"\bdetoks\w*", "detoks"), (r"\bbez nuspojava\b", "bez nuspojava"),
 ]
 ZABRANJENE_RE = [(re.compile(p), naziv) for p, naziv in ZABRANJENE_RIJECI]
+MEDICINSKE_RE = [(re.compile(p), naziv) for p, naziv in MEDICINSKE_RIJECI]
 
 IZUZECI_RE = [
     re.compile(r"dojenje je najbolji nacin prehrane dojenceta"),
+    re.compile(r"majcino mlijeko najbolja je hrana za dojence"),
+    re.compile(r"lijecnik\w*|lijecnick\w*"),                 # liječnik ≠ liječi
     re.compile(r"\bnajvise\b"), re.compile(r"\bnajmanje\b"),
     re.compile(r"\bnajkasnije\b"), re.compile(r"\bnajranije\b"),
 ]
@@ -325,15 +406,75 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def nadi_zabranjene_rijeci(tekst: str) -> list[str]:
+def nadi_zabranjene_rijeci(tekst: str, lijek: bool = False) -> list[str]:
     normirano = _norm(tekst)
     for izuzetak in IZUZECI_RE:
         normirano = izuzetak.sub(" ", normirano)
     nalazi = []
-    for uzorak, naziv in ZABRANJENE_RE:
+    for uzorak, naziv in ZABRANJENE_RE + ([] if lijek else MEDICINSKE_RE):
         m = uzorak.search(normirano)
         if m:
             nalazi.append(f"„{m.group(0)}“ ({naziv})")
+    return nalazi
+
+
+# ---------------------------------------------------------------------------
+# Šablonski počeci i podnaslovi (template ver.11, „Kako opis ne postaje šablona”)
+# ---------------------------------------------------------------------------
+
+ZABRANJENI_POCECI = ("ovaj proizvod", "riječ je o", "rijec je o", "predstavljamo",
+                     "u ponudi je", "dolazi u obliku")
+GENERICKI_PODNASLOVI = ("zašto ga odabrati", "zasto ga odabrati", "što dobivate",
+                        "sto dobivate", "prednosti za vas", "što ćete primijetiti",
+                        "sto cete primijetiti", "sastav i oblik", "kvaliteta",
+                        "doziranje", "opis proizvoda", "ključne prednosti",
+                        "kljucne prednosti", "zašto odabrati", "zasto odabrati")
+
+
+def je_genericki_podnaslov(naslov: str) -> bool:
+    n = _norm(naslov)
+    return any(n == _norm(g) or n.startswith(_norm(g) + " ") and len(n.split()) <= 4
+               for g in GENERICKI_PODNASLOVI)
+
+
+def pocinje_zabranjeno(recenica: str) -> str | None:
+    n = (recenica or "").strip().lower()
+    return next((p for p in ZABRANJENI_POCECI if n.startswith(p)), None)
+
+
+def ima_usklicnik_ili_emoji(tekst: str) -> bool:
+    bez_tablica = "\n".join(l for l in (tekst or "").splitlines()
+                            if not l.strip().startswith("|"))
+    return "!" in bez_tablica or bool(re.search(r"[\U0001F300-\U0001FAFF☀-➿]",
+                                                bez_tablica))
+
+
+# ---------------------------------------------------------------------------
+# Kopiranje teksta s drugih webshopova (zabranjeno)
+# ---------------------------------------------------------------------------
+
+def preuzeti_odlomci(tekst: str, usporedni_tekstovi: list[str], n: int = 8) -> list[str]:
+    """Nizovi od n riječi koji su doslovno preuzeti s usporednih izvora.
+    Tablice, sastav/INCI i obvezne zakonske rečenice se ne gledaju."""
+    def shingles(t: str) -> set[str]:
+        w = _norm(t).split()
+        return {" ".join(w[i:i + n]) for i in range(len(w) - n + 1)}
+
+    izvori = set()
+    for t in usporedni_tekstovi:
+        izvori |= shingles(t)
+    if not izvori:
+        return []
+    nalazi = []
+    for redak in (tekst or "").splitlines():
+        r = redak.strip()
+        if (not r or r.startswith(("|", "#")) or r.startswith("- Sadrži") or
+                re.match(r"(\*\*)?(Sastojci|INCI|Sastav|Puni)", r, re.IGNORECASE) or
+                r.count(",") >= 5):          # popis sastojaka / INCI prepisuje se doslovno
+            continue
+        zajednicko = shingles(r) & izvori
+        if zajednicko:
+            nalazi.append(sorted(zajednicko)[0])
     return nalazi
 
 

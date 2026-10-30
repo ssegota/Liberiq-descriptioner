@@ -33,6 +33,7 @@ import argparse
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pdp_generator as P
@@ -59,7 +60,12 @@ def gather_shared(product: P.Product, category: str, cache_dir: Path, args):
                                refresh=False,          # HTML je već svjež
                                web_search=not args.no_web_search,
                                max_web=args.search_results,
-                               secondary=not getattr(args, "no_secondary", False))
+                               secondary=not getattr(args, "no_secondary", False),
+                               pim_dir=Path(args.pim_dir) if args.pim_dir else None)
+    # eLjekarna24 je BigCommerce: puni opis (sastav, upute) izvlači PDP
+    # ekstraktor iz .pv-desc-source; SEO dobiva isti, potpuniji tekst
+    if sources and len(sources[0].text) > len(page.content or ""):
+        page.content = sources[0].text[:S.PAGE_CONTENT_CAP * 2]
     return page, sources
 
 
@@ -75,26 +81,55 @@ NAME_RE = __import__("re").compile(r"^###\s*Naziv proizvoda\s*$", __import__("re
 def canonical_name_from_md(md: str) -> str:
     """Naziv proizvoda iz generiranog PDP-a — title mora počinjati njime
     (klijentova uputa: title se ne gradi iz starog naziva s weba)."""
-    m = NAME_RE.search(md or "")
-    if not m:
-        return ""
-    for line in md[m.end():].splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            return line
-    return ""
+    return R.PROVJERITI_RE.sub(lambda m: m.group(1) or "", P.naziv_iz_md(md or "")).strip()
+
+
+def ugradi_seo(md: str, title: str, meta: str) -> str:
+    """Meta title i meta description iz SEO alata (pikselski provjereni)
+    upisuju se u tablicu SEO elementi PDP-a, da postoji jedna verzija."""
+    def zamijeni(redak: str) -> str:
+        celije = redak.strip().strip("|").split("|")
+        if len(celije) < 2:
+            return redak
+        kljuc = celije[0].strip().lower()
+        if kljuc == "meta title" and title:
+            return f"| Meta title | {title} |"
+        if kljuc == "meta description" and meta:
+            return f"| Meta description | {meta} |"
+        return redak
+    return "\n".join(zamijeni(l) if l.strip().startswith("|") else l
+                     for l in (md or "").splitlines()) + "\n"
+
+
+def seo_upute(letter: str, podvrsta: str, md: str) -> str:
+    """Pravila za SEO elemente iz templatea + prijedlog iz PDP-a."""
+    redovi = ["Meta title: [naziv, vrsta ili oblik, pakiranje]; bez skraćenih "
+              "zdravstvenih slogana („za imunitet”, „za srce”, „za energiju”).",
+              "Meta description do ~155 znakova; kreće od kuta proizvoda, a zatim "
+              "sadrži podatke propisane za kategoriju."]
+    if letter == "A":
+        redovi.append("Dodatak prehrani: meta description sadrži „dodatak prehrani”, "
+                      "glavni sastojak i količinu te pakiranje; bez učinaka.")
+    if letter == "C":
+        redovi.append("Hrana za dojenčad: meta description sadrži vrstu proizvoda, dob "
+                      "i pakiranje; bez ikakvih tvrdnji"
+                      + (" (početna formula: i da je za dojenčad od rođenja kada "
+                         "dojenje nije moguće)" if podvrsta == T.POCETNA_FORMULA else "")
+                      + ".")
+    seo = {r[0].lower(): r[1] for r in P.tablica(P.sekcije(md).get("SEO elementi", ""))
+           if len(r) > 1}
+    if seo.get("meta description"):
+        redovi.append("Prijedlog iz PDP opisa (smiješ ga preuzeti ako prolazi pravila): "
+                      + seo["meta description"])
+    return "\n".join("- " + r for r in redovi)
 
 
 def brand_source_for(sources, brend: str):
     """Izvor 2 za SEO: isključivo službena hrvatska stranica brenda.
     Sve ostalo (druge ljekarne, tražilice, strana tržišta) blokira allowlist."""
-    # izvor 2 (vasezdravlje) ima prednost pred izvorom 3 (stranica brenda)
-    for oznaka in (P.SECONDARY_LABEL, P.TERTIARY_LABEL):
-        for s in sources:
-            if s.kind != oznaka:
-                continue
-            if R.prioritet_izvora(s.url, brend) in (2, 3):
-                return S.BrandSource(url=s.url, text=s.text[:2000])
+    for s in sources:
+        if s.kind == P.KIND_BRAND and R.prioritet_izvora(s.url, brend) == 2:
+            return S.BrandSource(url=s.url, text=s.text[:3000])
     return None
 
 
@@ -105,9 +140,11 @@ SEO_COLS = ["Title tag", "Title px", "Title znakova", "Meta opis", "Meta px",
             "Preuzeto s brend stranice", "Napomena za provjeru",
             "Postojeći title (QA)", "Postojeći meta (QA)"]
 
-PDP_COLS = ["Kategorija predloška", "Status", "Pokušaji",
-            "Verifikacija (2. agent)", "Nepotkrijepljene tvrdnje",
+PDP_COLS = ["Kategorija predloška", "Podvrsta", "Klasifikacija", "Status",
+            "Pokušaji", "Verifikacija (2. agent)", "Nepotkrijepljene tvrdnje",
             "Ekstrahiranih polja", "Coverage check", "Konflikt izvora",
+            "Nedostaje", "Za provjeru (crveno)", "Regulatorno",
+            "Obrazac prve rečenice", "Informativno",
             "Broj izvora", "Izvori", "MD datoteka", "DOCX datoteka",
             "Napomene"]
 
@@ -132,11 +169,13 @@ def combined_record(product: P.Product, seo_res, pdp_res, model_id: str,
     statuses = [rec.get("SEO Status"), rec.get("PDP Status")]
     statuses = [s for s in statuses if s]
     if statuses and all(str(s).startswith("OK") for s in statuses):
-        rec["Ukupni status"] = "OK"
+        rec["Ukupni status"] = (P.STATUS_PROVJERITI
+                                if any(str(s) == P.STATUS_PROVJERITI for s in statuses)
+                                else "OK")
     else:
         # najozbiljniji status pobjeđuje (klijentove oznake)
-        prio = ["GREŠKA", "GREŠKA EKSTRAKCIJE", "NEDOSTAJE PODATAK IZ IZVORA",
-                "TREBA PROVJERA"]
+        prio = [P.STATUS_STOP, "GREŠKA", "GREŠKA EKSTRAKCIJE",
+                "NEDOSTAJE PODATAK IZ IZVORA", "TREBA PROVJERA"]
         rec["Ukupni status"] = next(
             (s for s in prio if any(str(x).startswith(s) for x in statuses)),
             "TREBA PROVJERA")
@@ -147,7 +186,8 @@ def combined_record(product: P.Product, seo_res, pdp_res, model_id: str,
 KLIJENT_COLS = ["Sekcija", "Brend", "SKU", "Naziv", "URL", "Title tag",
                 "Title (px)", "Meta opis", "Meta opis (px)"]
 
-INTERNI_COLS = ["Sekcija", "Brend", "SKU", "Naziv", "URL", "Status",
+INTERNI_COLS = ["Sekcija", "Brend", "SKU", "Naziv", "URL", "Status", "Template",
+                "Za provjeru (crveno)", "Regulatorno",
                 "Izvor – eljekarna24", "Izvor – brend", "Preuzeto s brend stranice",
                 "Nedostaje", "Konflikti", "Napomena validatora",
                 "PDP Status", "PDP datoteka", "Trajanje", "Model"]
@@ -197,6 +237,10 @@ def write_interni_file(records: list[dict], out_dir: Path):
             "SKU": r.get("SKU", ""), "Naziv": r.get("Naziv", ""),
             "URL": r.get("URL", ""),
             "Status": r.get("Ukupni status", ""),
+            "Template": " / ".join(x for x in (r.get("PDP Kategorija predloška", ""),
+                                               r.get("PDP Podvrsta", "")) if x),
+            "Za provjeru (crveno)": r.get("PDP Za provjeru (crveno)", ""),
+            "Regulatorno": r.get("PDP Regulatorno", ""),
             "Izvor – eljekarna24": r.get("SEO Izvor – eljekarna24", ""),
             "Izvor – brend": r.get("SEO Izvor – brend", ""),
             "Preuzeto s brend stranice": r.get("SEO Preuzeto s brend stranice", ""),
@@ -217,9 +261,9 @@ def write_interni_file(records: list[dict], out_dir: Path):
         ws = w.sheets["Interno"]
         for idx, col in enumerate(df.columns, start=1):
             ws.cell(row=1, column=idx).column_letter
-        for col, width in zip("ABCDEFGHIJKLMNOP",
-                              (16, 14, 12, 40, 44, 20, 44, 44, 34, 30, 34, 60,
-                               22, 44, 12, 26)):
+        for col, width in zip("ABCDEFGHIJKLMNOPQRS",
+                              (16, 14, 12, 40, 44, 20, 24, 60, 50, 44, 44, 34,
+                               30, 34, 60, 22, 44, 12, 26)):
             ws.column_dimensions[col].width = width
     return xlsx
 
@@ -275,10 +319,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--sku", action="append", default=[])
     ap.add_argument("--max-attempts", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=1,
+                    help="broj proizvoda koji se obrađuju istodobno (zadano 1)")
     ap.add_argument("--strogo", action="store_true",
                     help="doslovno po uputama: nedostatak EAN-a ili proizvođača "
                          "i korištenje izvora 2 daju TREBA PROVJERA")
     ap.add_argument("--search-results", type=int, default=3)
+    ap.add_argument("--pim-dir", default="",
+                    help="mapa s HR ambalažom / deklaracijom / PIM-om (razina 1); "
+                         "datoteke se prepoznaju po SKU-u ili EAN-u u nazivu")
     ap.add_argument("--no-web-search", action="store_true")
     ap.add_argument("--no-secondary", action="store_true",
                     help="ne koristi izvor 2 (službenu stranicu brenda)")
@@ -336,12 +385,12 @@ def main() -> None:
     if args.show_prompts:
         print("=" * 70 + "\n SEO — system prompt\n" + "=" * 70)
         print(S.build_system_prompt())
-        for cat in ("cosmetics", "supplement", "device", "formula"):
+        for cat in sorted(set(categories.values())):
             print("\n" + "=" * 70 +
                   f"\n PDP — system prompt ({T.CATEGORY_LABELS[cat]})\n" + "=" * 70)
             print(P.build_gen_system(cat))
-        print("\n" + "=" * 70 + "\n Kontrolor činjenica — system prompt\n" + "=" * 70)
-        print(P.build_verify_system())
+        print("\n" + "=" * 70 + "\n Stručna provjera — system prompt (A)\n" + "=" * 70)
+        print(P.build_verify_system("A"))
         return
 
     if args.dry_run:
@@ -354,7 +403,7 @@ def main() -> None:
         for s in sources:
             print(f"  [{s.sid}] {s.kind}: {s.url} ({len(s.text)} znakova)")
         print(f"\nSEO prompt: {len(S.build_system_prompt()) + len(S.build_user_message(p, page))} znakova")
-        print(f"PDP prompt: {len(P.build_gen_system(cat)) + len(P.build_gen_user(p, cat, sources))} znakova")
+        print(f"PDP prompt: {len(P.build_gen_system(cat)) + len(P.build_gen_user(p, cat, '', sources))} znakova")
         return
 
     config = P.load_bedrock_config()
@@ -382,72 +431,112 @@ def main() -> None:
             seen_titles.add(S.norm_compact(core))
             seen_metas.add(S.norm_compact(rec.get("SEO Meta opis", "")))
 
+    # kontrola serije: počeci prve rečenice po templateu (opća pravila)
+    zauzeti: dict[str, list[str]] = {}
+    for rec in records.values():
+        prva = rec.get("PDP Prva rečenica", "")
+        if prva:
+            zauzeti.setdefault(str(rec.get("PDP Template", "")), []).append(P.pocetak(prva))
+
     from botocore.exceptions import ClientError  # noqa: PLC0415
 
-    try:
-        for idx, p in enumerate(todo, start=1):
-            cat = categories[p.sku]
-            page, sources = gather_shared(p, cat, cache_dir, args)
+    zapis_lock = threading.Lock()
 
-            seo_res = pdp_res = None
-            canonical = ""
-
-            # Upute: ako stranica eljekarna24 nije dohvaćena, status je GREŠKA
-            # i ne generira se ni SEO ni PDP.
-            if not page.fetched or not sources:
-                rec = combined_record(p, None, None, client.model_id, page.fetched)
-                rec["Ukupni status"] = "GREŠKA"
-                rec["SEO Status"] = "GREŠKA"
-                rec["PDP Status"] = "GREŠKA"
-                rec["SEO Napomene"] = ("Stranica proizvoda na eljekarna24 nije "
-                                       "dohvaćena; sadržaj se ne generira.")
-                records[p.sku] = rec
-                with jsonl_path.open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                print(f"[{idx}/{len(todo)}] {p.sku} {p.naziv[:40]:<40} -> GREŠKA "
-                      "(stranica nije dohvaćena)")
-                continue
-
-            # PDP ide PRVI: iz njega dolazi kanonski naziv za title
-            if args.only in ("pdp", "both"):
-                pdp_res, md = P.process_product(
-                    p, cat, sources, client, args.max_attempts,
-                    do_verify=not args.no_verify,
-                    do_extract=not args.no_extract,
-                    do_coverage=not args.no_coverage)
-                canonical = canonical_name_from_md(md)
-                if md.strip():
-                    stem = f"PDP_{p.sku}_{P.slugify(p.naziv)}"
-                    md_path = pdp_dir / f"{stem}.md"
-                    docx_path = pdp_dir / f"{stem}.docx"
-                    md_path.write_text(md, encoding="utf-8")
-                    try:
-                        P.md_to_docx(md, docx_path)
-                        pdp_res.docx_path = str(docx_path)
-                    except Exception as err:  # noqa: BLE001
-                        pdp_res.notes.append(f"DOCX nije zapisan: {err}")
-                    pdp_res.md_path = str(md_path)
-
-            if args.only in ("seo", "both"):
-                seo_res = S.process_product(
-                    p, page, client, seen_titles, seen_metas, lock,
-                    args.max_attempts, canonical_name=canonical,
-                    brand_source=brand_source_for(sources, p.brend))
-
-            rec = combined_record(p, seo_res, pdp_res, client.model_id,
-                                  page.fetched)
-            records[p.sku] = rec
+    def zapisi(rec: dict) -> None:
+        with zapis_lock:
+            records[rec["SKU"]] = rec
             with jsonl_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-            bits = []
-            if seo_res:
-                bits.append(f"SEO {seo_res.status} "
-                            f"({seo_res.title_px:.0f}px/{seo_res.meta_px:.0f}px)")
-            if pdp_res:
-                bits.append(f"PDP {pdp_res.status}")
-            print(f"[{idx}/{len(todo)}] {p.sku} {p.naziv[:40]:<40} -> "
-                  f"{' | '.join(bits)}")
+    def obradi(idx: int, p) -> None:
+        t0 = time.time()
+        cat = categories[p.sku]
+        page, sources = gather_shared(p, cat, cache_dir, args)
+        podvrsta = T.podvrsta_heuristika(cat, p.naziv)
+        razlog = ""
+        if sources and args.only in ("pdp", "both"):
+            cat, podvrsta, razlog = P.klasificiraj(p, sources, client)
+
+        seo_res = pdp_res = None
+        canonical = md = ""
+
+        # Upute: ako stranica eljekarna24 nije dohvaćena, status je GREŠKA
+        # i ne generira se ni SEO ni PDP.
+        if not page.fetched or not sources:
+            rec = combined_record(p, None, None, client.model_id, page.fetched)
+            rec["Ukupni status"] = "GREŠKA"
+            rec["SEO Status"] = "GREŠKA"
+            rec["PDP Status"] = "GREŠKA"
+            rec["SEO Napomene"] = ("Stranica proizvoda na eljekarna24 nije "
+                                   "dohvaćena; sadržaj se ne generira.")
+            zapisi(rec)
+            print(f"[{idx}/{len(todo)}] {p.sku} {p.naziv[:40]:<40} -> GREŠKA "
+                  "(stranica nije dohvaćena)")
+            return
+
+        # PDP ide PRVI: iz njega dolazi kanonski naziv za title
+        if args.only in ("pdp", "both"):
+            pdp_res, md = P.process_product(
+                p, cat, sources, client, args.max_attempts,
+                do_verify=not args.no_verify,
+                do_extract=not args.no_extract,
+                do_coverage=not args.no_coverage,
+                podvrsta=podvrsta,
+                zauzeti_poceci=list(zauzeti.get(cat, [])))
+            pdp_res.klasifikacija = razlog
+            canonical = canonical_name_from_md(md)
+            if pdp_res.prva_recenica:
+                with zapis_lock:
+                    zauzeti.setdefault(cat, []).append(P.pocetak(pdp_res.prva_recenica))
+
+        if args.only in ("seo", "both") and (args.only == "seo" or md.strip()):
+            seo_res = S.process_product(
+                p, page, client, seen_titles, seen_metas, lock,
+                args.max_attempts, canonical_name=canonical,
+                brand_source=brand_source_for(sources, p.brend),
+                dodatne_upute=seo_upute(cat, podvrsta, md))
+            if md.strip() and str(seo_res.status).startswith("OK"):
+                md = ugradi_seo(md, seo_res.title, seo_res.meta)
+
+        if pdp_res is not None and md.strip():
+            stem = f"PDP_{p.sku}_{P.slugify(p.naziv)}"
+            md_path = pdp_dir / f"{stem}.md"
+            docx_path = pdp_dir / f"{stem}.docx"
+            md_path.write_text(md, encoding="utf-8")
+            try:
+                P.md_to_docx(md, docx_path)
+                pdp_res.docx_path = str(docx_path)
+            except Exception as err:  # noqa: BLE001
+                pdp_res.notes.append(f"DOCX nije zapisan: {err}")
+            pdp_res.md_path = str(md_path)
+
+        rec = combined_record(p, seo_res, pdp_res, client.model_id,
+                              page.fetched)
+        if pdp_res is not None:
+            rec["PDP Template"] = cat
+            rec["PDP Prva rečenica"] = pdp_res.prva_recenica
+        rec["Trajanje"] = f"{time.time() - t0:.0f} s"
+        zapisi(rec)
+
+        bits = []
+        if seo_res:
+            bits.append(f"SEO {seo_res.status} "
+                        f"({seo_res.title_px:.0f}px/{seo_res.meta_px:.0f}px)")
+        if pdp_res:
+            bits.append(f"PDP {pdp_res.status}")
+        print(f"[{idx}/{len(todo)}] {p.sku} {p.naziv[:40]:<40} -> "
+              f"{' | '.join(bits)}")
+
+    try:
+        if args.workers <= 1:
+            for idx, p in enumerate(todo, start=1):
+                obradi(idx, p)
+        else:
+            from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+            with ThreadPoolExecutor(max_workers=args.workers) as ex:
+                for fut in [ex.submit(obradi, idx, p)
+                            for idx, p in enumerate(todo, start=1)]:
+                    fut.result()
     except ClientError as err:
         print("\nBedrock greška:\n  " + P.explain_client_error(err, config))
         print("Obrađeno je spremljeno u results.jsonl — ponovno pokretanje "
@@ -466,6 +555,15 @@ def main() -> None:
     print(f"Za klijenta: {klijent_path}")
     print(f"Interno:     {interni_path}")
     print(f"Puni indeks: {xlsx_path}")
+    razlozi: dict[str, int] = {}
+    for r in ordered:
+        if str(r.get("Ukupni status", "")).startswith("OK"):
+            continue
+        for n in str(r.get("PDP Napomene", "")).split(" | ") + \
+                str(r.get("SEO Napomene", "")).split(" | "):
+            if n.strip():
+                oznaka = n.strip()[:70]
+                razlozi[oznaka] = razlozi.get(oznaka, 0) + 1
     if razlozi:
         print("\nNajčešći razlozi za TREBA PROVJERA:")
         for oznaka, broj in sorted(razlozi.items(), key=lambda x: -x[1])[:8]:

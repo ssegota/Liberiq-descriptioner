@@ -1,767 +1,432 @@
 # -*- coding: utf-8 -*-
 """
-Predlošci PDP struktura po kategorijama — točan format iz dokumenata:
-PDP_struktura.docx + četiri primjera (Effaclar, Solgar D3, Microlife BP A1, NAN 2).
+PDP templateovi eLjekarne24, verzija 11 (klijentovi dokumenti iz listopada 2026.).
 
-Ovaj modul je jedini izvor istine za format: iz njega čitaju i prompt
-(skeleton + primjer) i deterministički validator (nazivi tabova, obvezne
-fraze, fiksni blokovi). Meta-napomene iz primjera ("nakon researcha",
-"idealno iskomunicirati...") razriješene su u produkcijski sadržaj:
-FAQ se piše iz researcha, a fiksni blokovi (Tab 6, recenzije) se prepisuju
-doslovno iz predloška.
+Tekst pravila NIJE prepisan u kod: klijentovi dokumenti su u mapi predlosci/
+(opća pravila, 11 templateova A–K, tri checkliste, odobreni primjeri) i
+ulaze u prompt doslovno. Ovaj modul drži samo ono što kod mora znati da bi
+dokument mogao provjeriti: nazive i redoslijed tabova, retke tablice
+podataka, koji template ima brzu traku, FAQ i tvrdnje, te koji se template
+smije koristiti u kojoj kategoriji.
+
+Nova verzija templatea = nove datoteke u predlosci/ (+ eventualno izmjena
+TEMPLATE_META ako se promijene nazivi tabova ili redci tablice).
 """
 
+from __future__ import annotations
+
+import re
+from functools import lru_cache
+from pathlib import Path
+
+PREDLOSCI = Path(__file__).resolve().parent / "predlosci"
+
 # ---------------------------------------------------------------------------
-# Mapiranje Sekcija -> kategorija predloška
+# Kategorije webshopa -> dokument kategorije (predlosci/kategorije/NN.md)
 # ---------------------------------------------------------------------------
 
-SECTION_TO_CATEGORY = {
-    "kozmetika": "cosmetics",
-    "vitamini, minerali i kolageni": "supplement",
-    "beta glukani": "supplement",
-    "mliječne formule": "formula",
-    "mlijecne formule": "formula",
-    "cijeli webshop": "device",
+KATEGORIJE = {
+    "01": "Kozmetika",
+    "02": "Vitamini i dodaci prehrani",
+    "03": "Bebe, djeca i mame",
+    "04": "Zdravlje",
+    "05": "Lifestyle",
+    "06": "Parfemi i parfemski setovi",
+    "07": "Beauty uređaji",
+    "08": "Medicinski uređaji",
+    "09": "Rehabilitacijski program",
+    "10": "Dijagnostički testovi i zaštita",
 }
 
-CATEGORY_LABELS = {
-    "cosmetics": "kozmetika",
-    "supplement": "dodatak prehrani",
-    "device": "medicinski proizvod / uređaj",
-    "formula": "mliječna formula",
+# Sekcija iz ulazne tablice -> kategorija. Nepoznata sekcija ("Cijeli
+# webshop") smije koristiti bilo koji template; bira ga klasifikator.
+SEKCIJA_U_KATEGORIJU = {
+    "kozmetika": "01",
+    "vitamini, minerali i kolageni": "02",
+    "vitamini i dodaci prehrani": "02",
+    "beta glukani": "02",
+    "mliječne formule": "03",
+    "mlijecne formule": "03",
+    "bebe, djeca i mame": "03",
+    "zdravlje": "04",
+    "lifestyle": "05",
+    "parfemi i parfemski setovi": "06",
+    "parfemi": "06",
+    "beauty uređaji": "07",
+    "beauty uredaji": "07",
+    "medicinski uređaji": "08",
+    "medicinski uredaji": "08",
+    "rehabilitacijski program": "09",
+    "dijagnostički testovi i zaštita": "10",
+    "dijagnosticki testovi i zastita": "10",
 }
 
 # ---------------------------------------------------------------------------
-# Fiksni blokovi (prepisuju se doslovno; validator ih traži)
+# Metapodaci templateova (ono što validator provjerava)
 # ---------------------------------------------------------------------------
+# tabs: (broj, naziv, neobvezan). Neobvezan tab smije izostati, ali ostali
+#       zadržavaju broj iz templatea.
+# data_tab / data_rows: tab s tablicom „Podatak | Vrijednost” i njezini redci.
+# quickbar: brza traka na vrhu Taba 1.  faq: FAQ dopušten.
+# claims: blok odobrenih zdravstvenih tvrdnji (dokument tvrdnji 432/2012).
 
-BRZA_TRAKA_POLJA = ["Tip proizvoda", "Namjena", "Ciljana skupina",
-                    "Područje primjene", "Tekstura / oblik", "Pakiranje"]
-
-TAB6_LABEL = "Savjet ljekarnika (može voditi dodatno na kontakt prema ljekarniku nakon savjeta)"
-
-TAB6_BODY = """- Stručni savjet ljekarnika oko upotrebe ovog proizvoda. [Dopuniti iskustvima iz prakse ljekarnika eLjekarna24 prije objave.]
-- Mogućnost izravnog kontakta s ljekarnikom za dodatna pitanja."""
-
-REVIEWS_BODY = ("Prikazati stvarne recenzije kupaca iz sustava eLjekarna24, "
-                "uključujući kritične. Ne prenositi ocjene s drugih tržišta. "
-                "[Blok se puni automatski iz sustava recenzija.]")
-
-# ---------------------------------------------------------------------------
-# Definicije predložaka
-# ---------------------------------------------------------------------------
-
-TEMPLATES = {
-    # ------------------------------------------------------------- KOZMETIKA
-    "cosmetics": {
-        "tabs": [
-            "Opis i prednosti",
-            "Je li za moju kožu?",
-            "Kako se koristi?",
-            "Sastojci",
-            "Podatci i upozorenja",
-            TAB6_LABEL,
+TEMPLATE_META: dict[str, dict] = {
+    "A": {
+        "naziv": "Dodaci prehrani",
+        "tabs": [(1, "Opis i prednosti", False),
+                 (2, "Doza i kome je namijenjen", False),
+                 (3, "Kako se uzima?", False),
+                 (4, "Sastojci i sastav", False),
+                 (5, "Upozorenja i podaci", False)],
+        "data_tab": 5,
+        "data_rows": ["EAN", "Zemlja podrijetla",
+                      "Proizvođač / subjekt u poslovanju s hranom", "Brend"],
+        "quickbar": True, "faq": True, "faq_max": 4, "claims": True,
+        "kratki_opis": (2, 3),
+        "obvezne_recenice": [
+            "Dodatak prehrani nije nadomjestak ili zamjena uravnoteženoj "
+            "prehrani. Preporučene dnevne doze ne smiju se prekoračiti. "
+            "Čuvati izvan dohvata djece.",
+            "Važno je pridržavati se uravnotežene i raznovrsne prehrane te "
+            "zdravog načina života.",
         ],
-        "brza_traka": BRZA_TRAKA_POLJA,
-        "istaknuti_blok_uputa": (
-            'Naslov po ključnoj informaciji prije kupnje (npr. "Kako se uklapa u '
-            'rutinu?") + jedna uvodna rečenica + tablica (npr. 3 koraka rutine).'
-        ),
-        "tab2_hint": ('Dvostupčana tablica: "Ovu kremu razmotri ako | Prije kupnje '
-                      "zastani ako\" s po 3 retka."),
-        "tab4_hint": ('Tablica "Istaknuti sastojak | Što to znači za kožu" (3–4 '
-                      'sastojka POTVRĐENA u izvorima), zatim "Ostali:" i puni INCI '
-                      "iz izvora ili propisani placeholder."),
-        "mandatory_phrases": [
-            ("razmotri ako", "Tab 2 mora sadržavati tablicu 'razmotri ako / zastani ako'"),
-            ("zastani ako", "Tab 2 mora sadržavati stupac 'Prije kupnje zastani ako'"),
-            (("INCI:", "Puni INCI"),
-             "Tab 4 mora sadržavati puni INCI — doslovno prenesen popis uveden s "
-             "'INCI:' kada je pronađen u izvorima, inače propisani placeholder"),
-        ],
-        "allow_studies": True,
+        "checkliste": ["dodaci_prehrani"],
+        "primjer": "A_ferozomal.md",
     },
-    # ------------------------------------------------------ DODATAK PREHRANI
-    "supplement": {
-        "tabs": [
-            "Opis i prednosti",
-            "Doza i kome je namijenjen",
-            "Kako se uzima?",
-            "Sastojci i sastav",
-            "Upozorenja i podatci",
-            TAB6_LABEL,
-        ],
-        "brza_traka": BRZA_TRAKA_POLJA,
-        "istaknuti_blok_uputa": ('Naslov "Dnevna doza na prvi pogled" + tablica: '
-                                 "Preporučena doza | Količina aktivne tvari | Kada se "
-                                 "uzima | Trajanje pakiranja."),
-        "tab2_hint": ("2–4 natuknice kome je namijenjen + preporučena doza, sve "
-                      "prema deklaraciji iz izvora."),
-        "tab4_hint": ('Tablica "Istaknuti sastojak | Što to znači za kupca" + puni '
-                      "sastav iz izvora ili propisani placeholder."),
-        "mandatory_phrases": [
-            ("Dnevna doza na prvi pogled", "Istaknuti blok mora biti 'Dnevna doza na prvi pogled'"),
-            ("nije zamjena za", "Obvezna rečenica: dodatak prehrani nije zamjena za "
-                                "uravnoteženu i raznovrsnu prehranu"),
-            ("Ne prekoračuj", "Obvezno upozorenje o nepremašivanju preporučene dnevne doze"),
-        ],
-        "allow_studies": False,
+    "B": {
+        "naziv": "Kozmetika i dermokozmetika",
+        "tabs": [(1, "Opis i prednosti", False),
+                 (2, "Je li za moju kožu?", True),
+                 (3, "Kako se koristi", False),
+                 (4, "Sastojci", False),
+                 (5, "Podaci i upozorenja", False)],
+        "data_tab": 5,
+        "data_rows": ["Pakiranje", "Brend", "Odgovorna osoba",
+                      "Zemlja podrijetla", "EAN"],
+        "quickbar": True, "faq": True, "faq_max": 4, "claims": False,
+        "kratki_opis": (1, 2),
     },
-    # ---------------------------------------------------------------- UREĐAJ
-    "device": {
-        "tabs": [
-            "Opis i prednosti",
-            "Upute za korištenje?",
-            "Funkcije i specifikacije",
-            "Validacija i dokumentacija",
-            "Podaci i upute",
-            TAB6_LABEL,
-        ],
-        "brza_traka": BRZA_TRAKA_POLJA,
-        "istaknuti_blok_uputa": ("Naslov po ključnoj provjeri prije kupnje (npr. "
-                                 '"Odgovara li vam manšeta?") + tablica s tom provjerom.'),
-        "tab2_hint": "5–7 koraka uporabe u imperativu, prema uputi iz izvora.",
-        "tab3_hint": ('Tablica "Značajka | Što znači u svakodnevnoj uporabi" sa '
-                      "SAMO potvrđenim značajkama iz izvora."),
-        "mandatory_phrases": [
-            ("Značajka", "Tab 3 mora sadržavati tablicu 'Značajka | Što znači u svakodnevnoj uporabi'"),
-            ("uputu za uporabu", "Obvezno upućivanje na (hrvatsku) uputu za uporabu"),
-        ],
-        "allow_studies": False,
+    "C": {
+        "naziv": "Hrana za dojenčad i dječja hrana",
+        "tabs": [(1, "Opis i ključne informacije", False),
+                 (2, "Priprema i hranjenje", False),
+                 (3, "Sastav, alergeni i nutritivne vrijednosti", False),
+                 (4, "Čuvanje i sigurnost", False),
+                 (5, "Pakiranje i proizvođač", False)],
+        "data_tab": 5,
+        "data_rows": ["Pakiranje", "Brend",
+                      "Proizvođač / subjekt u poslovanju s hranom",
+                      "Zemlja podrijetla", "EAN"],
+        "quickbar": True, "faq": True, "faq_max": 3, "claims": True,
+        "kratki_opis": (1, 2),
+        "checkliste": ["djecja_hrana"],
+        "primjer": "C_nan_supremepro_1.md",
     },
-    # ------------------------------------------------------ MLIJEČNA FORMULA
-    "formula": {
-        "tabs": [
-            "Opis i ključne informacije",
-            "Priprema i hranjenje",
-            "Sastav, alergeni i nutritivne vrijednosti",
-            "Čuvanje i sigurnost",
-            "Pakiranje i proizvođač (plus ostali obavezni podaci)",
-            TAB6_LABEL,
+    "D": {
+        "naziv": "Medicinski uređaji",
+        "tabs": [(1, "Opis i prednosti", False),
+                 (2, "Upute za korištenje", False),
+                 (3, "Funkcije i specifikacije", False),
+                 (4, "U pakiranju, održavanje i jamstvo", False),
+                 (5, "Validacija, dokumentacija i podaci", False)],
+        "data_tab": 5,
+        "data_rows": ["Pakiranje", "Brend", "Model / referentna oznaka",
+                      "Proizvođač / ovlašteni predstavnik",
+                      "Zemlja podrijetla", "EAN"],
+        "quickbar": True, "faq": True, "faq_max": 4, "claims": False,
+        "kratki_opis": (1, 2),
+    },
+    "E": {
+        "naziv": "Beauty uređaji",
+        "tabs": [(1, "Opis i prednosti", False),
+                 (2, "Za koga je i usporedba modela", False),
+                 (3, "Kako se koristi", False),
+                 (4, "Specifikacije, u pakiranju i održavanje", False),
+                 (5, "Sigurnost i podaci", False)],
+        "data_tab": 5, "data_rows": None,
+        "quickbar": True, "faq": True, "faq_max": 4, "claims": False,
+        "kratki_opis": (1, 2),
+    },
+    "F": {
+        "naziv": "Ortoze, steznici, kompresivne čarape i kućna njega",
+        "tabs": [(1, "Opis i namjena", False),
+                 (2, "Odabir veličine", False),
+                 (3, "Kako se nosi", False),
+                 (4, "Materijal i održavanje", False),
+                 (5, "Upozorenja i podaci", False)],
+        "data_tab": 5, "data_rows": None,
+        "quickbar": True, "faq": True, "faq_max": 4, "claims": False,
+        "kratki_opis": (1, 2),
+    },
+    "G": {
+        "naziv": "Pelene i ulošci za inkontinenciju",
+        "tabs": [(1, "Opis i prednosti", False),
+                 (2, "Odabir razine i veličine", False),
+                 (3, "Kako se koristi", False),
+                 (4, "Podaci i upozorenja", False)],
+        "data_tab": 4, "data_rows": None,
+        "quickbar": True, "faq": True, "faq_max": 4, "claims": False,
+        "kratki_opis": (1, 2),
+    },
+    "H": {
+        "naziv": "Dijagnostički testovi i zaštita",
+        "tabs": None,  # ovisi o varijanti (H1/H2), vidi VARIJANTE
+        "data_tab": None, "data_rows": None,
+        "quickbar": True, "faq": True, "faq_max": 4, "claims": False,
+        "kratki_opis": (1, 2),
+    },
+    "I": {
+        "naziv": "Parfemi i parfemski setovi",
+        "tabs": [(1, "Opis mirisa", False),
+                 (2, "Mirisne note", False),
+                 (3, "Kako nanositi", True),
+                 (4, "Sastojci, upozorenja i podaci", False)],
+        "data_tab": 4, "data_rows": None,
+        "quickbar": True, "faq": True, "faq_max": 4, "claims": False,
+        "kratki_opis": (1, 2),
+    },
+    "J": {
+        "naziv": "Lifestyle proizvodi",
+        "tabs": [(1, "Opis i prednosti", False),
+                 (2, "Materijal, dimenzije i održavanje", False),
+                 (3, "Kako se koristi", True),
+                 (4, "Upozorenja i podaci", False)],
+        "data_tab": 4, "data_rows": None,
+        "quickbar": True, "faq": True, "faq_max": 4, "claims": False,
+        "kratki_opis": (1, 2),
+    },
+    "K": {
+        "naziv": "Bezreceptni lijekovi i homeopatski proizvodi",
+        "tabs": None,  # K1 / K2
+        "data_tab": 4, "data_rows": None,
+        "quickbar": True, "faq": False, "faq_max": 0, "claims": False,
+        "kratki_opis": (1, 3),
+        "obvezne_recenice": [
+            "Prije upotrebe pažljivo pročitajte uputu o lijeku, a o rizicima "
+            "i nuspojavama upitajte svog liječnika ili ljekarnika.",
         ],
-        "brza_traka": BRZA_TRAKA_POLJA,
-        "istaknuti_blok_uputa": ('Naslov "Prije kupnje provjerite" + tablica: Dobna '
-                                 "faza | Tip proizvoda | Alergen | Pakiranje."),
-        "tab2_hint": ("Koraci pripreme prema deklaraciji + uputa na tablicu "
-                      "hranjenja; bez izmišljenih omjera."),
-        "mandatory_phrases": [
-            ("Prije kupnje provjerite", "Istaknuti blok mora biti 'Prije kupnje provjerite'"),
-            ("Dojenje je najbolji", "Obvezna rečenica: 'Dojenje je najbolji način "
-                                    "prehrane dojenčeta.'"),
-            ("tablici hranjenja", "Priprema se mora vezati uz tablicu hranjenja s deklaracije"),
-        ],
-        "allow_studies": False,
     },
 }
 
-# Redci obveznog završnog bloka podataka (Tab 5) — validator ih traži unutar Tab 5
-TAB5_REQUIRED_ROWS = ["Pakiranje", "Brend", "Proizvođač", "Zemlja podrijetla",
-                      "EAN", "Obvezna provjera prije objave"]
-
-PLACEHOLDER_UNKNOWN = "Unijeti točno prema aktualnoj deklaraciji ili PIM-u."
-PLACEHOLDER_ORIGIN = ("Navesti samo ako je potvrđena na deklaraciji ili u "
-                      "dokumentaciji točnog proizvoda.")
-PLACEHOLDER_INCI = ("Puni INCI sastav s aktualne deklaracije (umetnuti točan popis "
-                    "bez prijevoda i skraćivanja).")
-
-# ---------------------------------------------------------------------------
-# Skeleton (dobiva ga model u promptu)
-# ---------------------------------------------------------------------------
-
-def build_skeleton(category: str) -> str:
-    t = TEMPLATES[category]
-    tabs = t["tabs"]
-    lines = [
-        "# PDP struktura s tabovima: {kratki naziv proizvoda}",
-        "",
-        "## 1. Prvi ekran: Naziv, opis i brzi podatci",
-        "",
-        "### Naziv proizvoda",
-        "",
-        "{Brend + naziv + glavna karakteristika/namjena + količina}",
-        "",
-        "### Kratki opis",
-        "",
-        "{jedna rečenica: što je proizvod, kome/čemu je namijenjen i glavna korist}",
-        "",
-        "### Brza traka ispod opisa",
-        "",
-        "| Tip proizvoda | {konkretan tip, npr. krema za lice} |",
-        "| --- | --- |",
-        "| Namjena | {konkretna namjena iz izvora} |",
-        "| Ciljana skupina | {kome je namijenjen} |",
-        "| Područje primjene | {gdje se primjenjuje} |",
-        "| Tekstura / oblik | {tekstura ili farmaceutski oblik} |",
-        "| Pakiranje | {količina s jedinicom} |",
-        "",
-        "{NIKAD ne prepisuj ovu uputu: svih šest polja mora biti popunjeno "
-        "konkretnim podatkom iz izvora}",
-        "",
-        "- {ključna prednost 1 — konkretna korist za kupca}",
-        "- {ključna prednost 2}",
-        "- {ključna prednost 3}",
-        "- {ključna prednost 4 — 3 do 4 prednosti ukupno}",
-        "",
-        "## 2. Istaknuti blok iznad tabova",
-        "",
-        "### {naslov istaknutog bloka}",
-        "",
-        "{jedna uvodna rečenica}",
-        "",
-        "| {stupac 1} | {stupac 2} |",
-        "| --- | --- |",
-        "| {…} | {…} |",
-        "",
-        "## 3. Struktura tabova (Max 6 tabova)",
-        "",
-        f"### Tab 1: {tabs[0]}",
-        "",
-        "{80–150 riječi; počinje situacijom kupca, zatim korist i uporaba, bez CTA}",
-        "",
-        f"### Tab 2: {tabs[1]}",
-        "",
-        "{" + t.get("tab2_hint", "sadržaj taba 2") + "}",
-        "",
-        f"### Tab 3: {tabs[2]}",
-        "",
-        "{" + t.get("tab3_hint", "sadržaj taba 3 prema primjeru kategorije") + "}",
-        "",
-        f"### Tab 4: {tabs[3]}",
-        "",
-        "{" + t.get("tab4_hint", "sadržaj taba 4 prema primjeru kategorije") + "}",
-        "",
-        f"### Tab 5: {tabs[4]}",
-        "",
-        "| Pakiranje | {…} |",
-        "| --- | --- |",
-        "| Brend | {…} |",
-        f"| Proizvođač / odgovorna osoba | {{iz izvora ili: {PLACEHOLDER_UNKNOWN}}} |",
-        f"| Zemlja podrijetla | {{iz izvora ili: {PLACEHOLDER_ORIGIN}}} |",
-        f"| EAN | {{iz izvora ili: {PLACEHOLDER_UNKNOWN}}} |",
-        "| Obvezna provjera prije objave | {što sve mora odgovarati aktualnom pakiranju} |",
-        "",
-        "{upozorenja iz deklaracije, jasnim rečenicama, svako u svom retku}",
-        "",
-        f"### Tab 6: {TAB6_LABEL}",
-        "",
-        TAB6_BODY,
-        "",
-    ]
-    n = 4
-    if t["allow_studies"]:
-        lines += [
-            f"## {n}. Kliničke studije",
-            "",
-            "{SAMO ako u izvorima postoje konkretni rezultati ispitivanja za točan "
-            "proizvod: uvodna rečenica + tablica 'Rezultat | Metoda mjerenja i izvor'. "
-            "Svaki redak: rezultat, vrijeme, broj ispitanika, metoda. Ako podataka "
-            "nema, cijelu ovu sekciju IZOSTAVI i nastavi numeraciju od "
-            f"{n}.}}",
-            "",
-        ]
-        n += 1
-    lines += [
-        f"## {n}. Ocjene i recenzije kupaca",
-        "",
-        REVIEWS_BODY,
-        "",
-        f"## {n + 1}. Često postavljana pitanja (FAQ)",
-        "",
-        "### {Pitanje 1?}",
-        "",
-        "{odgovor utemeljen na izvorima}",
-        "",
-        "{ukupno 3–5 pitanja, svako kao '### Pitanje?' + odgovor}",
-    ]
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Kanonski primjeri (few-shot; validator ih mora sam proglasiti ispravnima)
-# ---------------------------------------------------------------------------
-
-EXAMPLE_COSMETICS = """# PDP struktura s tabovima: La Roche-Posay Effaclar Duo+M krema
-
-## 1. Prvi ekran: Naziv, opis i brzi podatci
-
-### Naziv proizvoda
-
-La Roche-Posay Effaclar Duo+M krema za masnu kožu sklonu nepravilnostima 40 ml
-
-### Kratki opis
-
-Krema za svakodnevnu njegu masne kože sklone nepravilnostima koja pomaže smanjiti vidljivost mitesera, prištića i tragova nakon njih, uz osjećaj hidratacije.
-
-### Brza traka ispod opisa
-
-| Tip proizvoda | krema za lice |
-| --- | --- |
-| Namjena | njega masne kože sklone nepravilnostima |
-| Ciljana skupina | odrasli i adolescenti od 10 godina |
-| Područje primjene | lice |
-| Tekstura / oblik | krema |
-| Pakiranje | 40 ml |
-
-- Za mitesere i nepravilnosti: pomaže smanjiti njihovu vidljivost uz redovitu uporabu.
-- Za tragove nakon prištića: pomaže da izgledaju manje izraženo.
-- Za masnu kožu kojoj ipak treba njega: daje osjećaj hidratacije bez preskakanja kreme.
-- Za jednostavnu rutinu: nanosi se nakon čišćenja, ujutro i/ili navečer; prema podacima proizvoda može ispod šminke.
-
-## 2. Istaknuti blok iznad tabova
-
-### Kako se uklapa u rutinu?
-
-Tri jednostavna koraka iznad tabova kako bi kupac odmah vidio primjenu:
-
-| Korak | Što uključuje |
-| --- | --- |
-| 1. Očisti | Proizvod za čišćenje lica. |
-| 2. Nanesi kremu | Mali sloj na cijelo lice. |
-| 3. Zaštiti | Dnevni proizvod sa zaštitnim faktorom. |
-
-## 3. Struktura tabova (Max 6 tabova)
-
-### Tab 1: Opis i prednosti
-
-Ako se lice tijekom dana brzo počne sjajiti, a uz to se pojavljuju miteseri, prištići ili tragovi nakon njih, ova krema može biti praktičan korak u svakodnevnoj rutini. La Roche-Posay Effaclar Duo+M namijenjena je masnoj koži sklonoj nepravilnostima kod odraslih i adolescenata od 10 godina, prema podacima proizvoda. Pomaže smanjiti vidljivost nepravilnosti i tragova nakon njih, a istodobno daje osjećaj hidratacije. Nanosi se nakon čišćenja na cijelo lice, ujutro i/ili navečer, bez ispiranja. Ako se šminkaš, prema podacima proizvoda može poslužiti kao podloga za šminku. Za izražene, bolne ili dugotrajne promjene na koži opis proizvoda nije zamjena za savjet dermatologa ili ljekarnika.
-
-### Tab 2: Je li za moju kožu?
-
-| Ovu kremu razmotri ako | Prije kupnje zastani ako |
-| --- | --- |
-| Imaš masnu kožu koja se sjaji, osobito na čelu, nosu i bradi. | Tražiš izrazito bogatu kremu za vrlo suhu kožu. |
-| Želiš jednu kremu za svakodnevnu njegu kože na kojoj se pojavljuju miteseri i prištići. | Znaš da si osjetljiv/a na neki sastojak iz punog popisa. |
-| Tražiš proizvod za jutro, večer ili ispod šminke prema uputi proizvoda. | Imaš izražene, bolne ili dugotrajne promjene na koži. |
-
-### Tab 3: Kako se koristi?
-
-- Očisti lice proizvodom koji ti odgovara.
-- Nanesi malu količinu kreme na cijelo lice.
-- Izbjegavaj područje oko očiju.
-- Koristi je ujutro i/ili navečer.
-- Krema se ne ispire. Prema podacima proizvoda može se koristiti i kao podloga za šminku.
-
-### Tab 4: Sastojci
-
-| Istaknuti sastojak | Što to znači za kožu |
-| --- | --- |
-| Niacinamid | Za njegu kože s tragovima nakon nepravilnosti i za ujednačeniji izgled tena. |
-| Glicerin | Pomaže zadržati vlagu u formuli, što je korisno kada i masnoj koži treba dodatna hidratacija. |
-| Zinc PCA | Sastojak prisutan u formuli za njegu kože sklone nepravilnostima. |
-| Salicilna kiselina | Sastojak koji se često nalazi u njezi kože sklone začepljenim porama. |
-
-Ostali:
-
-Puni INCI sastav s aktualne deklaracije (umetnuti točan popis bez prijevoda i skraćivanja).
-
-### Tab 5: Podatci i upozorenja
-
-| Pakiranje | 40 ml |
-| --- | --- |
-| Brend | La Roche-Posay |
-| Proizvođač / odgovorna osoba | La Roche-Posay Laboratoire Dermatologique CAI, 86270 La Roche-Posay, Francuska. |
-| Zemlja podrijetla | Navesti samo ako je potvrđena na deklaraciji ili u dokumentaciji točnog proizvoda. |
-| EAN | 3337875863377 |
-| Obvezna provjera prije objave | Naziv, količina, INCI, upozorenja, odgovorna osoba i EAN moraju odgovarati aktualnoj ambalaži. |
-
-Samo za vanjsku uporabu.
-
-Izbjegavaj područje oko očiju. Ako proizvod dođe u dodir s očima, temeljito ih isperi vodom.
-
-Prije uporabe provjeri aktualni sastav na pakiranju.
-
-Kod izraženih, bolnih ili dugotrajnih promjena na koži potraži savjet ljekarnika ili dermatologa.
-
-### Tab 6: Savjet ljekarnika (može voditi dodatno na kontakt prema ljekarniku nakon savjeta)
-
-- Stručni savjet ljekarnika oko upotrebe ovog proizvoda. [Dopuniti iskustvima iz prakse ljekarnika eLjekarna24 prije objave.]
-- Mogućnost izravnog kontakta s ljekarnikom za dodatna pitanja.
-
-## 4. Kliničke studije
-
-Rezultati kliničke procjene proizvoda, uz navedenu metodu i broj ispitanika.
-
-| Rezultat | Metoda mjerenja i izvor |
-| --- | --- |
-| 66 % manje vidljivih mitesera nakon 4 tjedna | Klinička procjena na 45 ispitanika koji su proizvod koristili jednom dnevno ujutro. |
-| 44 % manje vidljivih nepravilnosti nakon 4 tjedna | Klinička procjena na 45 ispitanika koji su proizvod koristili jednom dnevno ujutro. |
-| 45 % manje vidljivih tragova nakon nepravilnosti nakon 4 tjedna | Klinička procjena na 42 ispitanika koji su proizvod koristili jednom dnevno ujutro. |
-| 24 sata hidratacije | Instrumentalno mjerenje na 24 ispitanika. |
-
-## 5. Ocjene i recenzije kupaca
-
-Prikazati stvarne recenzije kupaca iz sustava eLjekarna24, uključujući kritične. Ne prenositi ocjene s drugih tržišta. [Blok se puni automatski iz sustava recenzija.]
-
-## 6. Često postavljana pitanja (FAQ)
-
-### Je li ova krema dovoljna za vrlo suhu kožu?
-
-Namijenjena je masnoj koži sklonoj nepravilnostima. Ako imaš vrlo suhu kožu ili osjećaj jakog zatezanja, prije kupnje provjeri odgovara li ti tekstura i potraži bogatiju njegu ako je potrebna.
-
-### Mogu li je koristiti ispod šminke?
-
-Prema podacima proizvoda, može se koristiti kao podloga za šminku.
-
-### Kada mogu očekivati promjenu?
-
-Individualno iskustvo može se razlikovati. Ako za točan proizvod postoji klinička procjena s vremenskim okvirom, prikazuje se u bloku Kliničke studije uz uvjete ispitivanja.
-
-### Što ako mi koža postane neugodna ili nadražena?
-
-Prekini s uporabom ako se pojavi izražena nelagoda te se po potrebi obrati ljekarniku ili dermatologu. Provjeri i puni sastav proizvoda.
-"""
-
-EXAMPLE_SUPPLEMENT = """# PDP struktura s tabovima: Solgar Vitamin D3 400 IU
-
-## 1. Prvi ekran: Naziv, opis i brzi podatci
-
-### Naziv proizvoda
-
-Solgar Vitamin D3 400 IU, 100 kapsula
-
-### Kratki opis
-
-Dodatak prehrani s 10 µg, odnosno 400 IU vitamina D3 po kapsuli, za odrasle koji žele praktično nadopuniti dnevni unos vitamina D uz obrok.
-
-### Brza traka ispod opisa
-
-| Tip proizvoda | dodatak prehrani |
-| --- | --- |
-| Namjena | nadopuna dnevnog unosa vitamina D |
-| Ciljana skupina | odrasli |
-| Područje primjene | oralna primjena uz obrok |
-| Tekstura / oblik | kapsula |
-| Pakiranje | 100 kapsula |
-
-- Jedna kapsula sadržava 10 µg, odnosno 400 IU vitamina D3.
-- Vitamin D doprinosi normalnoj funkciji imunološkog sustava, pod uvjetima uporabe tvrdnje.
-- Vitamin D doprinosi održavanju normalnih kostiju i zuba te normalnoj funkciji mišića.
-- Uzima se jedna kapsula dnevno uz obrok; pakiranje može trajati do 100 dana.
-
-## 2. Istaknuti blok iznad tabova
-
-### Dnevna doza na prvi pogled
-
-Iznad tabova prikazuju se ključne informacije o dnevnoj dozi:
-
-| Preporučena doza | Količina vitamina D | Kada se uzima | Trajanje pakiranja |
-| --- | --- | --- | --- |
-| 1 kapsula dnevno | 10 µg / 400 IU | Uz obrok | Do 100 dana |
-
-## 3. Struktura tabova (Max 6 tabova)
-
-### Tab 1: Opis i prednosti
-
-Ako tražite jednostavan dodatak vitamina D koji se uzima jednom dnevno, Solgar Vitamin D3 400 IU sadržava 10 µg vitamina D3 u jednoj kapsuli. Namijenjen je odraslima koji žele nadopuniti dnevni unos vitamina D uz obrok. Vitamin D doprinosi normalnoj funkciji imunološkog sustava, normalnoj apsorpciji i iskorištavanju kalcija i fosfora te održavanju normalnih kostiju, zuba i funkcije mišića, kada se tvrdnje primjenjuju pod propisanim uvjetima. Pakiranje od 100 kapsula može trajati do 100 dana uz preporučenu uporabu. Dodatak prehrani nije zamjena za raznovrsnu prehranu. Ako ste trudni, dojite, uzimate lijekove ili imate zdravstvene poteškoće, prije uporabe obratite se liječniku ili ljekarniku.
-
-### Tab 2: Doza i kome je namijenjen
-
-- Odraslima koji žele praktično nadopuniti dnevni unos vitamina D.
-- Onima koji traže manju dozu od 400 IU po kapsuli, prema deklaraciji proizvoda.
-- Preporučena doza: jedna kapsula dnevno uz obrok, prema deklaraciji.
-
-### Tab 3: Kako se uzima?
-
-- Provjeri preporučenu dozu na aktualnom pakiranju.
-- Uzmi jednu kapsulu dnevno uz obrok.
-- Nemoj prekoračiti preporučenu dnevnu dozu.
-- Ako uzimaš lijekove ili druge dodatke s vitaminom D, zatraži savjet liječnika ili ljekarnika.
-
-### Tab 4: Sastojci i sastav
-
-| Istaknuti sastojak | Što to znači za kupca |
-| --- | --- |
-| Vitamin D3, kolekalciferol | Aktivni oblik naveden na deklaraciji proizvoda. |
-| 10 µg / 400 IU po kapsuli | Količina vitamina D u preporučenoj dnevnoj dozi od jedne kapsule. |
-| Ulje riblje jetre | Na stranici proizvoda naveden je kao izvor vitamina D. |
-
-Sastav: želatina, glicerin, pročišćena voda, ulje riblje jetre.
-
-### Tab 5: Upozorenja i podatci
-
-| Pakiranje | 100 kapsula |
-| --- | --- |
-| Brend | Solgar |
-| Proizvođač / odgovorna osoba | Unijeti točno prema aktualnoj deklaraciji ili PIM-u. |
-| Zemlja podrijetla | Navesti samo ako je potvrđena na deklaraciji ili u dokumentaciji točnog proizvoda. |
-| EAN | 033984033207 |
-| Obvezna provjera prije objave | Naziv dodatka, neto količina, preporučena dnevna doza, aktivne tvari po dnevnoj dozi, puni sastav, upozorenja i odgovorna osoba moraju odgovarati aktualnoj deklaraciji. |
-
-Dodatak prehrani nije zamjena za uravnoteženu i raznovrsnu prehranu ni zdrav način života.
-
-Ne prekoračujte preporučenu dnevnu dozu.
-
-Ako ste trudni, dojite, uzimate lijekove ili imate zdravstvene poteškoće, prije uporabe razgovarajte s liječnikom ili ljekarnikom.
-
-Čuvajte izvan dohvata djece i na sobnoj temperaturi, prema deklaraciji proizvoda.
-
-### Tab 6: Savjet ljekarnika (može voditi dodatno na kontakt prema ljekarniku nakon savjeta)
-
-- Stručni savjet ljekarnika oko upotrebe ovog proizvoda. [Dopuniti iskustvima iz prakse ljekarnika eLjekarna24 prije objave.]
-- Mogućnost izravnog kontakta s ljekarnikom za dodatna pitanja.
-
-## 4. Ocjene i recenzije kupaca
-
-Prikazati stvarne recenzije kupaca iz sustava eLjekarna24, uključujući kritične. Ne prenositi ocjene s drugih tržišta. [Blok se puni automatski iz sustava recenzija.]
-
-## 5. Često postavljana pitanja (FAQ)
-
-### Koliko kapsula smijem uzeti dnevno?
-
-Preporučena doza je jedna kapsula dnevno uz obrok, prema deklaraciji. Ne prekoračuj preporučenu dnevnu dozu.
-
-### Mogu li ga uzimati uz druge dodatke s vitaminom D?
-
-Ako uzimaš lijekove ili druge dodatke s vitaminom D, prije uporabe zatraži savjet liječnika ili ljekarnika.
-
-### Koliko traje jedno pakiranje?
-
-Pakiranje od 100 kapsula uz preporučenu dozu od jedne kapsule dnevno može trajati do 100 dana.
-"""
-
-EXAMPLE_DEVICE = """# PDP struktura s tabovima: Microlife BP A1 Easy tlakomjer
-
-## 1. Prvi ekran: Naziv, opis i brzi podatci
-
-### Naziv proizvoda
-
-Microlife BP A1 Easy automatski nadlaktični tlakomjer s manšetom 22–42 cm
-
-### Kratki opis
-
-Automatski tlakomjer za kućno mjerenje krvnog tlaka i pulsa na nadlaktici, s upravljanjem jednom tipkom, manšetom za opseg 22–42 cm i osnovnim priborom za početak uporabe.
-
-### Brza traka ispod opisa
-
-| Tip proizvoda | automatski nadlaktični tlakomjer |
-| --- | --- |
-| Namjena | kućno mjerenje krvnog tlaka i pulsa |
-| Ciljana skupina | odrasli koji prate krvni tlak kod kuće |
-| Područje primjene | nadlaktica, opseg 22–42 cm |
-| Tekstura / oblik | uređaj s manšetom |
-| Pakiranje | uređaj, manšeta, torbica, 4 AA baterije, dnevnik |
-
-- Za jednostavno mjerenje: mjerenje se pokreće jednom tipkom.
-- Za pravilan odabir veličine: priložena manšeta odgovara opsegu nadlaktice 22–42 cm.
-- Za lakše uočavanje pogreške: indikatori upozoravaju na pokret i nepravilno postavljenu manšetu; PAD može označiti nepravilnost pulsa tijekom mjerenja.
-- Za uporabu odmah nakon otvaranja: u kutiji su uređaj, manšeta, četiri AA baterije, torbica i dnevnik mjerenja.
-
-## 2. Istaknuti blok iznad tabova
-
-### Odgovara li vam manšeta?
-
-Prije kupnje izmjerite opseg nadlaktice. Ovaj uređaj dolazi s M-L manšetom koja je prikladna za:
-
-| Mjesto mjerenja | Opseg manšete |
-| --- | --- |
-| Nadlaktica | 22–42 cm |
-
-## 3. Struktura tabova (Max 6 tabova)
-
-### Tab 1: Opis i prednosti
-
-Ako želite kod kuće pratiti krvni tlak bez složenog podešavanja, Microlife BP A1 Easy automatski je tlakomjer za nadlakticu kojim se upravlja jednom tipkom. Priložena M-L manšeta odgovara opsegu nadlaktice od 22 do 42 cm, pa prije kupnje izmjerite svoju nadlakticu. Uređaj prema opisu proizvoda ima Gentle+ način napuhavanja te indikatore pokreta ruke, nepravilno postavljene manšete i nepravilnosti pulsa tijekom mjerenja. U pakiranju su manšeta, torbica, četiri AA baterije i dnevnik krvnog tlaka. Za usporediva mjerenja važno je svaki put pravilno sjediti, postaviti manšetu prema uputi i ne govoriti tijekom mjerenja. Tlakomjer prikazuje rezultat mjerenja, ali ne postavlja dijagnozu i nije zamjena za liječnički savjet niti razlog za samostalnu promjenu terapije.
-
-### Tab 2: Upute za korištenje?
-
-- Prije kupnje izmjeri opseg nadlaktice i potvrdi da je između 22 i 42 cm.
-- Prije mjerenja odmori se, sjedni oslonjenih leđa, stopala položi na pod i ne razgovaraj tijekom mjerenja.
-- Postavi manšetu na golu nadlakticu prema ilustraciji u uputi i podupri ruku tako da je manšeta približno u visini srca.
-- Pritisni tipku i ostani miran/na dok uređaj ne završi mjerenje.
-- Ako se pojavi indikator pokreta ili nepravilno postavljene manšete, provjeri uputu i ponovi mjerenje nakon kratkog odmora.
-- Zapiši rezultat u dnevnik. Za tumačenje ponavljanih ili zabrinjavajućih vrijednosti obrati se zdravstvenom djelatniku.
-
-### Tab 3: Funkcije i specifikacije
-
-| Značajka | Što znači u svakodnevnoj uporabi |
-| --- | --- |
-| M-L manšeta 22–42 cm | Prije kupnje izmjerite opseg nadlaktice. Manšeta koja ne odgovara ruci može otežati pravilno mjerenje. |
-| Upravljanje jednom tipkom | Pokretanje mjerenja je jednostavno i ne zahtijeva prolazak kroz složene izbornike. |
-| Gentle+ tehnologija | Microlife je opisuje kao prilagodbu napuhavanja manšete radi ugodnijeg mjerenja. |
-| PAD indikator | Može označiti nepravilnost pulsa primijećenu tijekom mjerenja. To nije dijagnoza poremećaja srčanog ritma. |
-| Indikator pokreta i manšete | Pomaže prepoznati mjerenje koje možda treba ponoviti nakon provjere položaja i upute. |
-| Baterije | Uređaj radi na četiri AA baterije. |
-
-### Tab 4: Validacija i dokumentacija
-
-Uz uređaj se isporučuje hrvatska uputa za uporabu.
-
-### Tab 5: Podaci i upute
-
-| Pakiranje | Uređaj, M-L manšeta, torbica, 4 AA baterije i dnevnik krvnog tlaka. |
-| --- | --- |
-| Brend | Microlife |
-| Model / referentna oznaka | BP A1 Easy. |
-| Proizvođač / ovlašteni predstavnik | Unijeti točno prema aktualnoj deklaraciji ili PIM-u. |
-| Zemlja podrijetla | Navesti samo ako je potvrđena na deklaraciji ili u dokumentaciji točnog proizvoda. |
-| EAN | 4719003310646 |
-| Jamstvo | Prikazati aktualne uvjete jamstva prema dokumentaciji. |
-| Obvezna provjera prije objave | Namjena, upozorenja, pribor i oznake moraju odgovarati točnoj varijanti modela i hrvatskoj uputi. |
-
-Prije prve uporabe pročitajte cijelu hrvatsku uputu za uporabu.
-
-Provjerite odgovara li priložena manšeta opsegu nadlaktice korisnika.
-
-Ne mjerite preko odjeće i ne govorite niti se pomičite tijekom mjerenja.
-
-Pojedinačan rezultat nije dijagnoza. Ne mijenjajte terapiju na temelju kućnog mjerenja bez dogovora sa zdravstvenim stručnjakom.
-
-PAD indikator može označiti nepravilnost pulsa tijekom mjerenja, ali ne dijagnosticira poremećaj srčanog ritma.
-
-### Tab 6: Savjet ljekarnika (može voditi dodatno na kontakt prema ljekarniku nakon savjeta)
-
-- Stručni savjet ljekarnika oko upotrebe ovog proizvoda. [Dopuniti iskustvima iz prakse ljekarnika eLjekarna24 prije objave.]
-- Mogućnost izravnog kontakta s ljekarnikom za dodatna pitanja.
-
-## 4. Ocjene i recenzije kupaca
-
-Prikazati stvarne recenzije kupaca iz sustava eLjekarna24, uključujući kritične. Ne prenositi ocjene s drugih tržišta. [Blok se puni automatski iz sustava recenzija.]
-
-## 5. Često postavljana pitanja (FAQ)
-
-### Kako znam odgovara li mi manšeta?
-
-Prije kupnje izmjeri opseg nadlaktice. Priložena M-L manšeta prikladna je za opseg od 22 do 42 cm.
-
-### Što znači PAD indikator?
-
-PAD može označiti nepravilnost pulsa primijećenu tijekom mjerenja. To nije dijagnoza poremećaja srčanog ritma; za tumačenje se obrati zdravstvenom djelatniku.
-
-### Trebam li kupiti baterije?
-
-Ne. U pakiranju su četiri AA baterije, uz torbicu i dnevnik krvnog tlaka.
-"""
-
-EXAMPLE_FORMULA = """# PDP struktura s tabovima: NAN 2 Supremepro
-
-## 1. Prvi ekran: Naziv, opis i brzi podatci
-
-### Naziv proizvoda
-
-NAN 2 Supremepro, prijelazna mliječna formula za dojenčad od 6 do 12 mjeseci, 800 g
-
-### Kratki opis
-
-Prijelazna mliječna formula u prahu za zdravu terminski rođenu dojenčad od 6 do 12 mjeseci, prema deklaraciji proizvoda, u pakiranju od 800 g.
-
-### Brza traka ispod opisa
-
-| Tip proizvoda | prijelazna mliječna formula u prahu |
-| --- | --- |
-| Namjena | prehrana dojenčadi od 6 do 12 mjeseci |
-| Ciljana skupina | zdrava terminski rođena dojenčad |
-| Područje primjene | priprema obroka prema tablici hranjenja |
-| Tekstura / oblik | prah |
-| Pakiranje | 800 g |
-
-- Za dobnu fazu: jasno označeno 6–12 mjeseci, prema deklaraciji.
-- Za transparentan odabir: puni sastav, alergeni i nutritivna tablica prije kupnje.
-- Za pravilnu pripremu: tablica hranjenja, točan omjer vode i praha te priložena mjerica.
-- Za praktičnu uporabu: pakiranje od 800 g s uputama o zatvaranju i čuvanju.
-
-## 2. Istaknuti blok iznad tabova
-
-### Prije kupnje provjerite
-
-Iznad tabova prikazuju se sigurnosni podaci za roditelja:
-
-| Dobna faza | Tip proizvoda | Alergen | Pakiranje |
-| --- | --- | --- | --- |
-| 6–12 mjeseci | Prijelazna formula | Sadržava mlijeko | 800 g |
-
-## 3. Struktura tabova (Max 6 tabova)
-
-### Tab 1: Opis i ključne informacije
-
-Ako tražite prijelaznu mliječnu formulu za dijete od 6 do 12 mjeseci, NAN 2 Supremepro prema deklaraciji je namijenjen zdravoj terminski rođenoj dojenčadi u toj dobnoj fazi. Dolazi u limenci od 800 g, a obrok se priprema isključivo prema tablici hranjenja, točnom omjeru vode i praha te uz priloženu mjericu. Formula sadržava mliječni šećer, djelomično hidrolizirane bjelančevine sirutke, biljna ulja, DHA, ARA, vitamine, minerale, oligosaharide i bakterijske kulture, prema deklaraciji proizvoda. Za individualna pitanja o formuli, alergiji, posebnoj prehrani ili dobi djeteta obratite se pedijatru ili ljekarniku.
-
-### Tab 2: Priprema i hranjenje
-
-- Obrok pripremaj isključivo prema tablici hranjenja s aktualne deklaracije, ovisno o dobi djeteta.
-- Operi ruke prije pripreme obroka.
-- Operi bočicu, dudu i poklopac te pribor prokuhaj prema uputi proizvođača.
-- Prokuhaj pitku vodu i ohladi je na približno 40 °C.
-- U bočicu ulij točnu količinu vode prema tablici hranjenja i dodaj točan broj ravnih mjerica.
-- Upotrebljavaj samo priloženu mjericu, dobro protresi i provjeri temperaturu obroka.
-- Limenku nakon uporabe čvrsto zatvori i čuvaj prema uputi na pakiranju.
-
-### Tab 3: Sastav, alergeni i nutritivne vrijednosti
-
-| Sastojak | Objašnjenje za kupca |
-| --- | --- |
-| Mliječni šećer i bjelančevine sirutke | Osnovne skupine sastojaka prema deklaraciji; formula sadržava mlijeko. |
-| Biljna ulja, DHA i ARA | Masnoće navedene na deklaraciji proizvoda. |
-| Vitamini i minerali | Prema nutritivnoj tablici na deklaraciji. |
-| Oligosaharidi i bakterijske kulture | Sastojci navedeni na deklaraciji proizvoda. |
-
-Puni sastav ide ispod glavnih sastojaka, ali roditelj mora iznad njega odmah vidjeti alergen, glavne skupine sastojaka i upozorenje da se formula ne bira prema jednom istaknutom sastojku.
-
-### Tab 4: Čuvanje i sigurnost
-
-Proizvod se koristi samo prema uputi i tablici hranjenja proizvođača.
-
-Ne mijenjajte omjer praha i vode i ne koristite drugu mjericu.
-
-Dobna oznaka je 6–12 mjeseci, prema deklaraciji proizvoda.
-
-Formula sadržava mlijeko; prije uporabe provjerite sve alergene na aktualnoj deklaraciji.
-
-Dojenje je najbolji način prehrane dojenčeta. Za pitanja o primjeni formule, dobi djeteta ili posebnim potrebama obratite se pedijatru ili ljekarniku.
-
-### Tab 5: Pakiranje i proizvođač (plus ostali obavezni podaci)
-
-| Pakiranje | 800 g |
-| --- | --- |
-| Brend | NAN |
-| Proizvođač / subjekt u poslovanju s hranom | Unijeti točno prema aktualnoj deklaraciji ili PIM-u. |
-| Zemlja podrijetla | Navesti samo ako je potvrđena na deklaraciji ili u dokumentaciji točnog proizvoda. |
-| EAN | 7613035943742 |
-| Rok trajanja i LOT | Kupac ih provjerava na isporučenoj ambalaži; ne unositi statičan datum koji se može razlikovati među serijama. |
-| Obvezna provjera prije objave | Točan naziv i faza, neto količina, sastav, alergeni, nutritivna tablica, priprema, čuvanje, upozorenja i odgovorni subjekt moraju odgovarati aktualnoj limenci. |
-
-### Tab 6: Savjet ljekarnika (može voditi dodatno na kontakt prema ljekarniku nakon savjeta)
-
-- Stručni savjet ljekarnika oko upotrebe ovog proizvoda. [Dopuniti iskustvima iz prakse ljekarnika eLjekarna24 prije objave.]
-- Mogućnost izravnog kontakta s ljekarnikom za dodatna pitanja.
-
-## 4. Ocjene i recenzije kupaca
-
-Prikazati stvarne recenzije kupaca iz sustava eLjekarna24, uključujući kritične. Ne prenositi ocjene s drugih tržišta. [Blok se puni automatski iz sustava recenzija.]
-
-## 5. Često postavljana pitanja (FAQ)
-
-### Za koju je dob namijenjena ova formula?
-
-Prema deklaraciji, namijenjena je zdravoj terminski rođenoj dojenčadi od 6 do 12 mjeseci, kao prijelazna formula.
-
-### Sadržava li alergene?
-
-Formula sadržava mlijeko. Prije uporabe provjerite sve alergene na aktualnoj deklaraciji.
-
-### Kako se pravilno priprema obrok?
-
-Isključivo prema tablici hranjenja s deklaracije: točan omjer vode i praha, priložena mjerica i provjera temperature obroka prije hranjenja.
-"""
-
-EXAMPLES = {
-    "cosmetics": EXAMPLE_COSMETICS,
-    "supplement": EXAMPLE_SUPPLEMENT,
-    "device": EXAMPLE_DEVICE,
-    "formula": EXAMPLE_FORMULA,
+VARIJANTE = {
+    "H1": [(1, "Opis", False), (2, "Kada testirati", False),
+           (3, "Kako se koristi", False), (4, "Kako pročitati rezultat", False),
+           (5, "Upozorenja i podaci", False)],
+    "H2": [(1, "Opis i namjena", False), (2, "Veličina i materijal", False),
+           (3, "Kako se koristi", False), (4, "Upozorenja i podaci", False)],
+    "K1": [(1, "Za što se koristi", False), (2, "Doziranje i primjena", False),
+           (3, "Upozorenja, kontraindikacije i nuspojave", False),
+           (4, "Sastav i podaci", False)],
+    "K2": [(1, "Opis", False), (2, "Doziranje i primjena", False),
+           (3, "Upozorenja", False), (4, "Sastav i podaci", False)],
+    # kućna njega bolesnika: Tab 2 postaje „Dimenzije i nosivost”
+    "F-kucna-njega": [(1, "Opis i namjena", False),
+                      (2, "Dimenzije i nosivost", False),
+                      (3, "Kako se nosi", False),
+                      (4, "Materijal i održavanje", False),
+                      (5, "Upozorenja i podaci", False)],
 }
+
+# Podvrste koje mijenjaju pravila (određuje klasifikator prema deklaraciji).
+PODVRSTE = {
+    "A": ["dodatak prehrani", "biljni dodatak prehrani",
+          "biljni čaj (nije dodatak prehrani)"],
+    "C": ["početna formula", "prijelazna formula", "dječja hrana",
+          "prerađena hrana na bazi žitarica", "druga hrana za djecu"],
+    "D": ["uređaj s elektronikom", "jednostavni medicinski proizvod"],
+    "F": ["ortoza / steznik / čarapa", "kućna njega bolesnika"],
+    "H": ["H1", "H2"],
+    "K": ["K1", "K2"],
+}
+
+POCETNA_FORMULA = "početna formula"
+
+
+def tabs_for(letter: str, podvrsta: str = "") -> list[tuple[int, str, bool]]:
+    meta = TEMPLATE_META[letter]
+    if letter in ("H", "K"):
+        return VARIJANTE.get(podvrsta) or VARIJANTE[f"{letter}1"]
+    if letter == "F" and podvrsta == "kućna njega bolesnika":
+        return VARIJANTE["F-kucna-njega"]
+    return meta["tabs"]
+
+
+def faq_dopusten(letter: str, podvrsta: str = "") -> bool:
+    if letter == "C" and podvrsta == POCETNA_FORMULA:
+        return False
+    return TEMPLATE_META[letter]["faq"]
+
+
+def tvrdnje_dopustene(letter: str, podvrsta: str = "") -> bool:
+    if letter == "C":
+        return podvrsta != POCETNA_FORMULA
+    return TEMPLATE_META[letter]["claims"]
+
+
+def label(letter: str) -> str:
+    return f"{letter}: {TEMPLATE_META[letter]['naziv']}"
+
+
+# Zadržano zbog postojećih stupaca u indeksu.
+CATEGORY_LABELS = {k: label(k) for k in TEMPLATE_META}
+
+# ---------------------------------------------------------------------------
+# Klijentovi dokumenti
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=None)
+def _read(rel: str) -> str:
+    path = PREDLOSCI / rel
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def opca_pravila() -> str:
+    return _read("opca_pravila.md")
+
+
+def template_tekst(letter: str) -> str:
+    return _read(f"templateovi/{letter}.md")
+
+
+def checkliste_za(letter: str, podvrsta: str = "") -> list[tuple[str, str]]:
+    """[(naziv, tekst)] checkliste koje vrijede uz template."""
+    if letter == "A":
+        if podvrsta == "biljni dodatak prehrani":
+            return [("Checklista: biljni dodaci prehrani",
+                     _read("checkliste/biljni_dodaci_prehrani.md"))]
+        return [("Checklista: dodaci prehrani",
+                 _read("checkliste/dodaci_prehrani.md"))]
+    if letter == "C":
+        return [("Checklista: dječja hrana i hrana za dojenčad",
+                 _read("checkliste/djecja_hrana.md"))]
+    return []
+
+
+def primjer_za(letter: str) -> str:
+    """Primjer gotovog dokumenta u izlaznom formatu (samo A i C su odobreni)."""
+    name = TEMPLATE_META[letter].get("primjer")
+    return _read(f"primjeri/format/{name}") if name else ""
+
+
+def odabir_tekst(kategorija: str | None) -> str:
+    if kategorija:
+        return _read(f"kategorije/{kategorija}.md")
+    return "\n\n".join(_read(f"kategorije/{k}.md") for k in KATEGORIJE)
+
+
+@lru_cache(maxsize=None)
+def dopusteni_templateovi(kategorija: str | None) -> tuple[str, ...]:
+    """Templateovi navedeni u dokumentu kategorije; sve ako je nepoznata."""
+    if not kategorija:
+        return tuple(TEMPLATE_META)
+    found = re.findall(r"Template ([A-K]):", _read(f"kategorije/{kategorija}.md"))
+    return tuple(dict.fromkeys(found)) or tuple(TEMPLATE_META)
+
+
+def kategorija_za(sekcija: str) -> str | None:
+    return SEKCIJA_U_KATEGORIJU.get((sekcija or "").strip().lower())
+
+
+# ---------------------------------------------------------------------------
+# Heuristični odabir (bez modela) — za dry-run i kao zadana vrijednost
+# ---------------------------------------------------------------------------
+
+_HEUR = [
+    ("K", ("homeopat", "lijek bez recepta", "vaporub")),
+    ("C", ("nan ", "formula", "mliječna hrana", "mlijecna hrana", "kašica",
+           "kasica", "aptamil", "bebivita", "hipp")),
+    ("D", ("tlakomjer", "inhalator", "vaga", "toplomjer", "aspirator",
+           "senzor", "adapter", "tens", "izdajalic", "fiziološk", "flaster")),
+    ("H", ("test za", "test na", "maska", "rukavic", "dezinf")),
+    ("I", ("parfem", "toaletna voda", "edp", "edt")),
+    ("G", ("pelen", "uložak", "ulozak", "inkontinen")),
+    ("F", ("ortoz", "steznik", "kompresivn", "hodalic")),
+    ("A", ("vitamin", "mineral", "kolagen", "glukan", "kapsul", "tablet",
+           "vrećic", "vrecic", "sirup", "žele bombon", "zele bombon",
+           "dodatak prehrani", "magnezij", "željezo", "zeljezo", "selen",
+           "omega", "probiotik", "kapi")),
+    ("B", ("krema", "serum", "šampon", "sampon", "losion", "gel", "sprej",
+           "balzam", "mlijeko", "spf", "deo", "termalna", "pjena", "sindet")),
+]
 
 
 def category_for(sekcija: str, naziv: str = "") -> str:
-    key = (sekcija or "").strip().lower()
-    if key in SECTION_TO_CATEGORY:
-        return SECTION_TO_CATEGORY[key]
-    text = f"{key} {naziv}".lower()
-    if any(w in text for w in ("tlakomjer", "inhalator", "vaga", "senzor", "adapter",
-                               "toplomjer", "uređaj", "uredaj")):
-        return "device"
-    if any(w in text for w in ("formula", "mliječ", "mlijec")):
-        return "formula"
-    if any(w in text for w in ("vitamin", "mineral", "kolagen", "glukan", "kapsul",
-                               "tablet", "dodatak prehrani")):
-        return "supplement"
-    return "cosmetics"
+    """Najvjerojatniji template prema sekciji i nazivu (bez modela)."""
+    allowed = dopusteni_templateovi(kategorija_za(sekcija))
+    if len(allowed) == 1:
+        return allowed[0]
+    text = f" {(naziv or '').lower()} "
+    for letter, words in _HEUR:
+        if letter in allowed and any(w in text for w in words):
+            return letter
+    return allowed[0]
+
+
+def podvrsta_heuristika(letter: str, naziv: str = "") -> str:
+    n = (naziv or "").lower()
+    if letter == "C":
+        if re.search(r"\bpre\b|\b1\b", n):
+            return POCETNA_FORMULA
+        if re.search(r"\b2\b", n):
+            return "prijelazna formula"
+        if re.search(r"\b[34]\b", n):
+            return "druga hrana za djecu"
+        return POCETNA_FORMULA if "formula" in n or "nan" in n else "dječja hrana"
+    if letter == "D":
+        return ("uređaj s elektronikom"
+                if re.search(r"tlakomjer|inhalator|vaga|toplomjer|senzor|tens", n)
+                else "jednostavni medicinski proizvod")
+    return (PODVRSTE.get(letter) or [""])[0]
+
+
+# ---------------------------------------------------------------------------
+# Izlazni format (kostur) — isti za sve templateove, tabovi iz metapodataka
+# ---------------------------------------------------------------------------
+
+def build_skeleton(letter: str, podvrsta: str = "") -> str:
+    meta = TEMPLATE_META[letter]
+    lines = [
+        "# [Naziv proizvoda, isti kao H1]",
+        "",
+        "## SEO elementi",
+        "",
+        "| Element | Tekst |",
+        "| --- | --- |",
+        "| Meta title | [naziv, vrsta ili oblik, pakiranje] │ eLjekarna24 |",
+        "| Meta description | [do ~155 znakova; kreće od kuta proizvoda] |",
+        "| H1 | [jednak nazivu proizvoda] |",
+        "| Alt tekst | [naziv i pakiranje] |",
+        "",
+        "## Prvi ekran",
+        "",
+        "**Naziv proizvoda:** [naziv]",
+        "",
+        "**Kratki opis:** [%d–%d rečenice]" % meta["kratki_opis"],
+        "",
+    ]
+    for n, title, optional in tabs_for(letter, podvrsta):
+        lines.append(f"## Tab {n}: {title}")
+        lines.append("")
+        if n == 1:
+            if letter == "C":
+                lines += ["**VAŽNA NAPOMENA:** [napomena o dojenju]", ""]
+            if meta["quickbar"]:
+                lines += ["**Brza traka:** [oznaka] · [oznaka] · [oznaka]", ""]
+            lines += ["### [podnaslov s činjenicom o ovom proizvodu]", "",
+                      "[odlomak]", ""]
+            if tvrdnje_dopustene(letter, podvrsta):
+                lines += ["- Sadrži [sastojak] koji doprinosi [odobrena tvrdnja].",
+                          ""]
+        else:
+            lines += ["[sadržaj prema templateu" +
+                      (" — tab je neobvezan, izostavi ga ako nema što jasno reći"
+                       if optional else "") + "]", ""]
+        if n == meta.get("data_tab") and meta.get("data_rows"):
+            lines += ["| Podatak | Vrijednost |", "| --- | --- |"]
+            lines += [f"| {row} | [vrijednost] |" for row in meta["data_rows"]]
+            lines.append("")
+    if faq_dopusten(letter, podvrsta):
+        lines += ["## Česta pitanja", "",
+                  "**[Pitanje?]**", "", "[Odgovor, najviše 2–3 rečenice.]", "",
+                  "(FAQ je neobvezan: izostavi cijeli odjeljak ako nema dobrog pitanja.)"]
+    return "\n".join(lines).rstrip() + "\n"
