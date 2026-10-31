@@ -41,6 +41,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -62,6 +63,36 @@ GEN_TEMPERATURE = 0.3
 VERIFY_MAX_TOKENS = 3000
 EXTRACT_MAX_TOKENS = 8000
 VERIFY_TEMPERATURE = 0.0
+THINKING_HEADROOM = 16000     # modeli koji uvijek razmišljaju (Opus 5.5)
+# modeli koji ne primaju temperature i uvijek razmišljaju
+NOVI_MODEL_RE = re.compile(r"opus-(4-[78]|5)|sonnet-5|fable|mythos")
+
+# USD po milijunu tokena: ulaz, izlaz, čitanje iz cachea, upis u cache.
+# Cjenik Anthropica (listopad 2026.); Bedrock je partnerski cjenik, provjeriti
+# na aws.amazon.com/bedrock/pricing prije ponude klijentu.
+CIJENE = {
+    "opus-5-5": (4.00, 20.00, 0.20, 5.00),
+    "opus-5": (5.00, 25.00, 0.50, 6.25),
+    "opus-4-8": (5.00, 25.00, 0.50, 6.25),
+    "sonnet-5-5": (2.00, 10.00, 0.20, 2.50),
+    "sonnet-5": (2.00, 10.00, 0.20, 2.50),
+    "sonnet-4-6": (3.00, 15.00, 0.30, 3.75),
+    "haiku-5-5": (0.10, 0.50, 0.01, 0.125),
+}
+
+
+def trosak_usd(usage: dict[str, dict[str, int]]) -> float:
+    """Trošak u USD za {model: {input, output, cache_read, cache_write}}."""
+    ukupno = 0.0
+    for model, u in usage.items():
+        cijena = next((v for k, v in sorted(CIJENE.items(), key=lambda x: -len(x[0]))
+                       if k in model), None)
+        if cijena is None:
+            continue
+        ukupno += (u.get("input", 0) * cijena[0] + u.get("output", 0) * cijena[1]
+                   + u.get("cache_read", 0) * cijena[2]
+                   + u.get("cache_write", 0) * cijena[3]) / 1e6
+    return ukupno
 BEDROCK_RETRIES = 6
 
 # Strogi način (--strogo): svaki crveno označeni podatak daje TREBA PROVJERA.
@@ -677,6 +708,16 @@ class BedrockClient:
         self.verify_model_id = config["BEDROCK_VERIFY_MODEL_ID"]
         self.rescue_model_id = config.get("BEDROCK_RESCUE_MODEL_ID") or ""
         self._cache_ok = True
+        self._bez_temperature: set[str] = set()
+        self._uvijek_razmislja: set[str] = set()
+        self._usage_lock = threading.Lock()
+        self.usage: dict[str, dict[str, int]] = {}            # model -> zbroj
+        self._usage_dretve: dict[int, dict[str, dict[str, int]]] = {}
+        for m in (self.model_id, self.verify_model_id,
+                  config.get("BEDROCK_RESCUE_MODEL_ID") or ""):
+            if NOVI_MODEL_RE.search(m or ""):
+                self._bez_temperature.add(m)
+                self._uvijek_razmislja.add(m)
         self._client = boto3.client(
             "bedrock-runtime",
             region_name=config["BEDROCK_AWS_REGION"],
@@ -697,14 +738,22 @@ class BedrockClient:
                 # dugi system prompt (pravila, template, checklista) je isti za
                 # sve proizvode iste kategorije: prompt caching
                 system.append({"cachePoint": {"type": "default"}})
+            cfg = {"maxTokens": max_tokens}
+            if model_id not in self._bez_temperature:
+                cfg["temperature"] = temperature
+            if model_id in self._uvijek_razmislja:
+                # thinking se naplaćuje kao izlaz i troši maxTokens
+                cfg["maxTokens"] = max_tokens + THINKING_HEADROOM
             try:
                 resp = self._client.converse(
                     modelId=model_id, system=system,
                     messages=[{"role": "user", "content": [{"text": user_message}]}],
-                    inferenceConfig={"maxTokens": max_tokens,
-                                     "temperature": temperature},
+                    inferenceConfig=cfg,
                 )
+                self._zabiljezi(model_id, resp.get("usage") or {})
                 blocks = resp["output"]["message"]["content"]
+                if any("reasoningContent" in b for b in blocks):
+                    self._uvijek_razmislja.add(model_id)
                 return "".join(b.get("text", "") for b in blocks).strip()
             except ClientError as err:
                 code = err.response["Error"]["Code"]
@@ -712,6 +761,11 @@ class BedrockClient:
                 if code == "ValidationException" and self._cache_ok and \
                         "cach" in msg.lower():
                     self._cache_ok = False
+                    continue
+                # noviji modeli (npr. Opus 5.5) ne primaju temperature
+                if code == "ValidationException" and "temperature" in msg.lower() \
+                        and model_id not in self._bez_temperature:
+                    self._bez_temperature.add(model_id)
                     continue
                 if code in {"ThrottlingException", "ServiceUnavailableException",
                             "InternalServerException", "ModelNotReadyException",
@@ -721,6 +775,23 @@ class BedrockClient:
                     continue
                 raise
         raise last_err  # type: ignore[misc]
+
+    def _zabiljezi(self, model_id: str, usage: dict) -> None:
+        polja = {"inputTokens": "input", "outputTokens": "output",
+                 "cacheReadInputTokens": "cache_read",
+                 "cacheWriteInputTokens": "cache_write"}
+        with self._usage_lock:
+            for cilj in (self.usage,
+                         self._usage_dretve.setdefault(threading.get_ident(), {})):
+                z = cilj.setdefault(model_id, {v: 0 for v in polja.values()} | {"poziva": 0})
+                z["poziva"] += 1
+                for k, v in polja.items():
+                    z[v] += int(usage.get(k) or 0)
+
+    def usage_dretve(self) -> dict[str, dict[str, int]]:
+        """Potrošnja tokena trenutne dretve (za trošak po proizvodu)."""
+        with self._usage_lock:
+            return json.loads(json.dumps(self._usage_dretve.get(threading.get_ident(), {})))
 
     def generate(self, system_prompt: str, user_message: str,
                  model_id: str | None = None) -> str:

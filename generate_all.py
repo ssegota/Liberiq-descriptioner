@@ -460,6 +460,7 @@ def main() -> None:
 
     def obradi(idx: int, p) -> None:
         t0 = time.time()
+        prije = client.usage_dretve()
         cat = categories[p.sku]
         page, sources = gather_shared(p, cat, cache_dir, args)
         podvrsta = T.podvrsta_heuristika(cat, p.naziv)
@@ -527,6 +528,12 @@ def main() -> None:
             rec["PDP Template"] = cat
             rec["PDP Prva rečenica"] = pdp_res.prva_recenica
         rec["Trajanje"] = f"{time.time() - t0:.0f} s"
+        poslije = client.usage_dretve()
+        potroseno = {m: {k: v - prije.get(m, {}).get(k, 0) for k, v in u.items()}
+                     for m, u in poslije.items()}
+        potroseno = {m: u for m, u in potroseno.items() if u.get("poziva")}
+        rec["Tokeni"] = json.dumps(potroseno, ensure_ascii=False)
+        rec["Trošak USD"] = round(P.trosak_usd(potroseno), 4)
         zapisi(rec)
 
         bits = []
@@ -555,6 +562,11 @@ def main() -> None:
         sys.exit(1)
 
     ordered = [records[p.sku] for p in products if p.sku in records]
+    (out_dir / "token_usage.json").write_text(json.dumps(
+        {"modeli": client.usage, "trosak_usd": round(P.trosak_usd(client.usage), 2),
+         "proizvoda": len(todo)}, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"Tokeni ovog pokretanja: {P.trosak_usd(client.usage):.2f} USD "
+          f"({len(todo)} proizvoda) — {out_dir / 'token_usage.json'}")
     xlsx_path, csv_path = write_index(ordered, out_dir)
     klijent_path = write_klijent_file(ordered, out_dir)
     interni_path = write_interni_file(ordered, out_dir)
