@@ -201,7 +201,6 @@ title i meta description u PDP-u su oni koje je provjerio SEO alat (pikseli).
 | --- | --- |
 | OK | prošla automatska kontrola i stručna provjera, nema crvenih oznaka |
 | OK, PROVJERITI CRVENO | prošlo sve, ali postoje crveno označeni podaci (provjeriti na ambalaži prije objave) |
-| TREBA PROVJERA | i nakon svih pokušaja ostale su greške (stupac Napomene) |
 | ZAUSTAVLJENO | biljna vrsta s Priloga III. NN 160/2013: opis se ne piše |
 | GREŠKA / GREŠKA EKSTRAKCIJE | stranica eLjekarne24 nije dohvaćena / ekstrakcija nije uspjela |
 

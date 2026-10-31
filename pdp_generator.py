@@ -1857,10 +1857,12 @@ def _zavrsi(result: RowResult, md: str, interni: dict, sources: list[Source],
         result.conflicts = [str(x) for x in interni["konflikti"]]
     result.provjeriti = oznake_za_provjeru(md)
     result.prva_recenica = (recenice(kratki_opis(md)) or [""])[0]
-    if not ok:
-        result.status = STATUS_REVIEW
-    elif result.provjeriti or result.nedostaje or result.regulatorno:
-        result.status = STATUS_REVIEW if STROGI_NACIN else STATUS_PROVJERITI
+    # Status „TREBA PROVJERA” je ukinut (klijent, 31. 10. 2026.): isporučuje se
+    # najbolja verzija, a status kaže samo ima li podataka za provjeru na
+    # ambalaži (crvene oznake, obvezni podatak koji nedostaje, regulatorna
+    # napomena). Preostale napomene kontrole ostaju samo u results.jsonl.
+    if result.provjeriti or result.nedostaje or result.regulatorno:
+        result.status = STATUS_PROVJERITI
     else:
         result.status = STATUS_OK
     return result

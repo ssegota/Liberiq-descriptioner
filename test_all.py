@@ -219,8 +219,13 @@ check("redak: PDP template i crvene oznake",
 check("redak: ukupni status nosi crvene oznake",
       rec["Ukupni status"] == P.STATUS_PROVJERITI, f"({rec['Ukupni status']})")
 pdp_res.status = "TREBA PROVJERA"
-check("redak: jedan pao -> TREBA PROVJERA",
-      A.combined_record(PROD, seo_res, pdp_res, "m", True)["Ukupni status"] == "TREBA PROVJERA")
+r_bez = A.combined_record(PROD, seo_res, pdp_res, "m", True)
+check("redak: TREBA PROVJERA ukinut -> status po crvenim oznakama",
+      r_bez["Ukupni status"] == P.STATUS_PROVJERITI and r_bez["PDP Status"] == P.STATUS_PROVJERITI,
+      f"({r_bez['Ukupni status']})")
+t = A.za_tablicu(r_bez)
+check("tablica: bez stupaca napomena i verifikacije",
+      not any(k.endswith(("Napomene", "Verifikacija (2. agent)", "Pokušaji")) for k in t))
 pdp_res.status = P.STATUS_PROVJERITI
 check("--only seo: nema PDP stupaca",
       not any(k.startswith("PDP ") for k in A.combined_record(PROD, seo_res, None, "m", True)))

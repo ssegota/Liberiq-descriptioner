@@ -149,6 +149,40 @@ PDP_COLS = ["Kategorija predloška", "Podvrsta", "Klasifikacija", "Status",
             "Napomene"]
 
 
+GRESKE = (P.STATUS_STOP, "GREŠKA")
+
+# Stupci koji su služili samo statusu „TREBA PROVJERA” (ukinut 31. 10. 2026.);
+# ostaju u results.jsonl za dijagnostiku, ali ne idu u tablice.
+IZOSTAVLJENI = ("Napomene", "Nepotkrijepljene tvrdnje", "Verifikacija (2. agent)",
+                "Coverage check", "Pokušaji", "Napomena za provjeru", "Informativno")
+
+
+def uskladi_status(rec: dict) -> dict:
+    """Bez statusa „TREBA PROVJERA”: OK ili OK, PROVJERITI CRVENO (ima crvenih
+    oznaka, nedostajućih obveznih podataka ili regulatornih napomena);
+    GREŠKA i ZAUSTAVLJENO ostaju."""
+    crveno = any(str(rec.get(k, "")).strip() for k in
+                  ("PDP Za provjeru (crveno)", "PDP Nedostaje", "PDP Regulatorno"))
+    for k in ("SEO Status", "PDP Status"):
+        st = str(rec.get(k, "") or "")
+        if st and not st.startswith(("OK",) + GRESKE):
+            rec[k] = "OK"
+    statusi = [str(rec.get(k)) for k in ("SEO Status", "PDP Status") if rec.get(k)]
+    greska = next((g for g in statusi if g.startswith(GRESKE)), None)
+    if greska:
+        rec["Ukupni status"] = greska
+    else:
+        rec["Ukupni status"] = P.STATUS_PROVJERITI if crveno else "OK"
+        if rec.get("PDP Status") == "OK" and crveno:
+            rec["PDP Status"] = P.STATUS_PROVJERITI
+    return rec
+
+
+def za_tablicu(rec: dict) -> dict:
+    return {k: v for k, v in uskladi_status(dict(rec)).items()
+            if not any(k.endswith(i) for i in IZOSTAVLJENI)}
+
+
 def combined_record(product: P.Product, seo_res, pdp_res, model_id: str,
                     page_fetched: bool) -> dict:
     """Jedan redak: ulaz + SEO stupci (prefiks 'SEO ') + PDP stupci ('PDP ')."""
@@ -180,7 +214,7 @@ def combined_record(product: P.Product, seo_res, pdp_res, model_id: str,
             (s for s in prio if any(str(x).startswith(s) for x in statuses)),
             "TREBA PROVJERA")
     rec["Model"] = model_id
-    return rec
+    return uskladi_status(rec)
 
 
 KLIJENT_COLS = ["Sekcija", "Brend", "SKU", "Naziv", "URL", "Title tag",
@@ -189,7 +223,7 @@ KLIJENT_COLS = ["Sekcija", "Brend", "SKU", "Naziv", "URL", "Title tag",
 INTERNI_COLS = ["Sekcija", "Brend", "SKU", "Naziv", "URL", "Status", "Template",
                 "Za provjeru (crveno)", "Regulatorno",
                 "Izvor – eljekarna24", "Izvor – brend", "Preuzeto s brend stranice",
-                "Nedostaje", "Konflikti", "Napomena validatora",
+                "Nedostaje", "Konflikti",
                 "PDP Status", "PDP datoteka", "Trajanje", "Model"]
 
 
@@ -228,10 +262,6 @@ def write_interni_file(records: list[dict], out_dir: Path):
 
     redci = []
     for r in records:
-        napomene = " | ".join(
-            x for x in (r.get("SEO Napomene", ""), r.get("PDP Napomene", ""),
-                        r.get("PDP Coverage check", ""))
-            if x and x != "prolazi" and not str(x).startswith("kontrolor:"))
         redci.append({
             "Sekcija": r.get("Sekcija", ""), "Brend": r.get("Brend", ""),
             "SKU": r.get("SKU", ""), "Naziv": r.get("Naziv", ""),
@@ -247,7 +277,6 @@ def write_interni_file(records: list[dict], out_dir: Path):
             "Nedostaje": " | ".join(x for x in (r.get("PDP Nedostaje", ""),
                                                r.get("SEO Nedostaje", "")) if x),
             "Konflikti": r.get("PDP Konflikt izvora", ""),
-            "Napomena validatora": napomene,
             "PDP Status": r.get("PDP Status", ""),
             "PDP datoteka": r.get("PDP DOCX datoteka", ""),
             "Trajanje": r.get("Trajanje", ""),
@@ -344,7 +373,8 @@ def parse_args() -> argparse.Namespace:
                     help="preskoči coverage check nakon pisanja")
     ap.add_argument("--refresh-cache", action="store_true")
     ap.add_argument("--force", action="store_true")
-    ap.add_argument("--retry-review", action="store_true")
+    ap.add_argument("--retry-review", action="store_true",
+                    help="ponovno obradi samo retke s greškom")
     ap.add_argument("--prompts-dir", default="prompts",
                     help="mapa s vanjskim promptovima/napomenama (zadano: prompts)")
     ap.add_argument("--show-prompts", action="store_true",
@@ -424,8 +454,9 @@ def main() -> None:
 
     done = {} if args.force else load_done(jsonl_path)
     if args.retry_review:
+        # ponavljaju se samo retci s greškom (TREBA PROVJERA više ne postoji)
         done = {k: v for k, v in done.items()
-                if str(v.get("Ukupni status", "")).startswith("OK")}
+                if str(uskladi_status(dict(v)).get("Ukupni status", "")).startswith("OK")}
     records: dict[str, dict] = dict(done)
     todo = [p for p in products if p.sku not in records]
     if len(products) - len(todo):
@@ -562,38 +593,27 @@ def main() -> None:
         sys.exit(1)
 
     ordered = [records[p.sku] for p in products if p.sku in records]
-    (out_dir / "token_usage.json").write_text(json.dumps(
-        {"modeli": client.usage, "trosak_usd": round(P.trosak_usd(client.usage), 2),
-         "proizvoda": len(todo)}, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"Tokeni ovog pokretanja: {P.trosak_usd(client.usage):.2f} USD "
-          f"({len(todo)} proizvoda) — {out_dir / 'token_usage.json'}")
+    if todo:
+        (out_dir / "token_usage.json").write_text(json.dumps(
+            {"modeli": client.usage, "trosak_usd": round(P.trosak_usd(client.usage), 2),
+             "proizvoda": len(todo)}, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"Tokeni ovog pokretanja: {P.trosak_usd(client.usage):.2f} USD "
+              f"({len(todo)} proizvoda) — {out_dir / 'token_usage.json'}")
+    ordered = [za_tablicu(r) for r in ordered]
     xlsx_path, csv_path = write_index(ordered, out_dir)
     klijent_path = write_klijent_file(ordered, out_dir)
     interni_path = write_interni_file(ordered, out_dir)
 
-    ok = sum(1 for r in ordered if str(r.get("Ukupni status", "")).startswith("OK"))
-    print(f"\nGotovo: {ok} OK, {len(ordered) - ok} za provjeru.")
+    from collections import Counter  # noqa: PLC0415
+    brojac = Counter(str(r.get("Ukupni status", "")) for r in ordered)
+    print("\nGotovo: " + ", ".join(f"{v} {k}" for k, v in brojac.most_common()))
     if args.only in ("pdp", "both"):
         print(f"PDP datoteke: {pdp_dir}/  (MD + DOCX po proizvodu)")
     print(f"Za klijenta: {klijent_path}")
     print(f"Interno:     {interni_path}")
     print(f"Puni indeks: {xlsx_path}")
-    razlozi: dict[str, int] = {}
-    for r in ordered:
-        if str(r.get("Ukupni status", "")).startswith("OK"):
-            continue
-        for n in str(r.get("PDP Napomene", "")).split(" | ") + \
-                str(r.get("SEO Napomene", "")).split(" | "):
-            if n.strip():
-                oznaka = n.strip()[:70]
-                razlozi[oznaka] = razlozi.get(oznaka, 0) + 1
-    if razlozi:
-        print("\nNajčešći razlozi za TREBA PROVJERA:")
-        for oznaka, broj in sorted(razlozi.items(), key=lambda x: -x[1])[:8]:
-            print(f"  {broj:4d}x  {oznaka}")
-    if len(ordered) - ok:
-        print("Retke koji nisu OK regeneriraj s: --retry-review (ili --sku <SKU>).")
-
+    if any(k.startswith(GRESKE) for k in brojac):
+        print("Retke s greškom ponovi s: --retry-review (ili --sku <SKU>).")
 
 if __name__ == "__main__":
     main()

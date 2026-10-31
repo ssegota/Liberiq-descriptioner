@@ -144,12 +144,13 @@ datoteka), plus zbirni **Ukupni status**.
 | --- | --- |
 | `OK` | prošlo sve kontrole i stručnu provjeru, bez crvenih oznaka |
 | `OK, PROVJERITI CRVENO` | prošlo sve; crveno označene podatke provjeriti na ambalaži prije objave |
-| `TREBA PROVJERA` | nešto nije prošlo ni nakon svih pokušaja (stupac Napomene) |
 | `ZAUSTAVLJENO` | zabranjena biljna vrsta (NN 160/2013, Prilog III.) |
 | `GREŠKA EKSTRAKCIJE` | nije moguće pouzdano izvući strukturirana polja |
 | `GREŠKA` | nema stranice proizvoda na eLjekarni24 |
 
-Retke koji nisu OK regeneriraj s `--retry-review`.
+Status „TREBA PROVJERA” je ukinut (31. 10. 2026.): isporučuje se najbolja verzija
+nakon svih pokušaja (osnovni model + `--rescue-model`), a preostale napomene kontrole
+ostaju samo u `results.jsonl`. Retke s greškom ponovi s `--retry-review`.
 
 ---
 
@@ -238,6 +239,5 @@ scraping eLjekarne24.
 | `[ValidationException]` | pogrešan model ID — provjeri `aws bedrock list-inference-profiles` |
 | `[AccessDeniedException]` | IAM nema `bedrock:InvokeModel` ili model nije odobren u Bedrock konzoli |
 | `[ThrottlingException]` | rate limit; alat sam ponavlja, a prekinuti run nastavlja gdje je stao |
-| Puno `TREBA PROVJERA` | pogledaj stupce *Napomene* i *Coverage check*; često znači da stranica proizvoda nema dovoljno sadržaja |
 | `Stranica dohvaćena = ne` | URL nedostupan ili blokiran; `--refresh-cache` za ponovni pokušaj |
 | DOCX se ne stvara | `pip install python-docx` |

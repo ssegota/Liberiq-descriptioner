@@ -198,8 +198,9 @@ check("interni stupci sadrže tražena polja",
       all(c in A.INTERNI_COLS for c in
           ("Status", "Template", "Za provjeru (crveno)", "Regulatorno",
            "Izvor – eljekarna24", "Izvor – brend",
-           "Preuzeto s brend stranice", "Nedostaje", "Konflikti",
-           "Napomena validatora")))
+           "Preuzeto s brend stranice", "Nedostaje", "Konflikti")))
+check("nema stupca „Napomena validatora” (TREBA PROVJERA ukinut)",
+      "Napomena validatora" not in A.INTERNI_COLS)
 check("klijentska datoteka nema internih stupaca",
       not any(c in A.KLIJENT_COLS for c in
               ("Status", "Pokušaji", "Napomene", "Izvori", "Model")))
