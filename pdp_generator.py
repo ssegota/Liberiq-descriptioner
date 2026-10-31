@@ -64,6 +64,13 @@ VERIFY_MAX_TOKENS = 3000
 EXTRACT_MAX_TOKENS = 8000
 VERIFY_TEMPERATURE = 0.0
 THINKING_HEADROOM = 16000     # modeli koji uvijek razmišljaju (Opus 5.5)
+# Sonnet piše, Opus dobiva dodatne pokušaje samo kad Sonnet ne prođe kontrolu.
+DEFAULT_RESCUE_MODEL = "eu.anthropic.claude-opus-5-5"
+# Stupanj razmišljanja po vrsti poziva: klasifikacija i ekstrakcija su
+# jednostavne (low), pisanje i stručna provjera traže više (medium).
+DEFAULT_EFFORT = {"extract": "low", "generate": "medium", "verify": "medium"}
+BATCH_MIN = 100               # Bedrock batch: najmanje 100 zapisa po jobu
+BATCH_SUFIKS = "#batch"       # ključ potrošnje za batch (pola cijene, bez cachea)
 # modeli koji ne primaju temperature i uvijek razmišljaju
 NOVI_MODEL_RE = re.compile(r"opus-(4-[78]|5)|sonnet-5|fable|mythos")
 
@@ -82,16 +89,18 @@ CIJENE = {
 
 
 def trosak_usd(usage: dict[str, dict[str, int]]) -> float:
-    """Trošak u USD za {model: {input, output, cache_read, cache_write}}."""
+    """Trošak u USD za {model: {input, output, cache_read, cache_write}}.
+    Ključ s BATCH_SUFIKS = Bedrock batch: pola cijene izravnog poziva."""
     ukupno = 0.0
     for model, u in usage.items():
+        faktor = 0.5 if model.endswith(BATCH_SUFIKS) else 1.0
         cijena = next((v for k, v in sorted(CIJENE.items(), key=lambda x: -len(x[0]))
                        if k in model), None)
         if cijena is None:
             continue
-        ukupno += (u.get("input", 0) * cijena[0] + u.get("output", 0) * cijena[1]
-                   + u.get("cache_read", 0) * cijena[2]
-                   + u.get("cache_write", 0) * cijena[3]) / 1e6
+        ukupno += faktor * (u.get("input", 0) * cijena[0] + u.get("output", 0) * cijena[1]
+                            + u.get("cache_read", 0) * cijena[2]
+                            + u.get("cache_write", 0) * cijena[3]) / 1e6
     return ukupno
 BEDROCK_RETRIES = 6
 
@@ -692,43 +701,64 @@ def load_bedrock_config() -> dict:
     missing = [key for key, value in config.items() if not value]
     if missing:
         sys.exit(f"Nedostaje u .env: {', '.join(missing)}")
-    # model za dodatne pokušaje kad osnovni model ne prođe kontrolu (npr. Opus)
-    config["BEDROCK_RESCUE_MODEL_ID"] = os.getenv("BEDROCK_RESCUE_MODEL_ID", "")
+    # osnovni model (pisac) je iz .env (Sonnet); kad ne prođe kontrolu, dodatni
+    # pokušaji idu modelom za spašavanje (zadano Opus 5.5; "" isključuje)
+    config["BEDROCK_RESCUE_MODEL_ID"] = os.getenv("BEDROCK_RESCUE_MODEL_ID",
+                                                  DEFAULT_RESCUE_MODEL)
     config["BEDROCK_VERIFY_MODEL_ID"] = (os.getenv("BEDROCK_VERIFY_MODEL_ID")
                                          or config["BEDROCK_TEXT_MODEL_ID"])
+    # Bedrock batch (pola cijene): IAM uloga koju Bedrock preuzima + S3 prefiks
+    config["BEDROCK_BATCH_ROLE_ARN"] = os.getenv("BEDROCK_BATCH_ROLE_ARN", "")
+    config["BEDROCK_BATCH_S3"] = os.getenv("BEDROCK_BATCH_S3", "")
     return config
 
 
 class BedrockClient:
-    def __init__(self, config: dict):
+    """Pozivi modela preko Bedrock Converse API-ja.
+
+    Svaki poziv ima vrstu (classify/extract, generate, verify) i za nju stupanj
+    razmišljanja (`effort`): jednostavni koraci rade s niskim, pisanje i stručna
+    provjera sa srednjim. Bilježi se potrošnja tokena po modelu i po dretvi."""
+
+    def __init__(self, config: dict, effort: dict[str, str] | None = None):
         import boto3
         from botocore.config import Config
 
+        self.config = config
         self.model_id = config["BEDROCK_TEXT_MODEL_ID"]
         self.verify_model_id = config["BEDROCK_VERIFY_MODEL_ID"]
         self.rescue_model_id = config.get("BEDROCK_RESCUE_MODEL_ID") or ""
+        self.effort = dict(DEFAULT_EFFORT if effort is None else effort)
         self._cache_ok = True
         self._bez_temperature: set[str] = set()
         self._uvijek_razmislja: set[str] = set()
+        self._bez_efforta: set[str] = set()
         self._usage_lock = threading.Lock()
         self.usage: dict[str, dict[str, int]] = {}            # model -> zbroj
         self._usage_dretve: dict[int, dict[str, dict[str, int]]] = {}
-        for m in (self.model_id, self.verify_model_id,
-                  config.get("BEDROCK_RESCUE_MODEL_ID") or ""):
+        for m in (self.model_id, self.verify_model_id, self.rescue_model_id):
             if NOVI_MODEL_RE.search(m or ""):
                 self._bez_temperature.add(m)
                 self._uvijek_razmislja.add(m)
+        self._session_kw = dict(region_name=config["BEDROCK_AWS_REGION"],
+                                aws_access_key_id=config["BEDROCK_AWS_ACCESS_KEY_ID"],
+                                aws_secret_access_key=config["BEDROCK_AWS_SECRET_ACCESS_KEY"])
         self._client = boto3.client(
-            "bedrock-runtime",
-            region_name=config["BEDROCK_AWS_REGION"],
-            aws_access_key_id=config["BEDROCK_AWS_ACCESS_KEY_ID"],
-            aws_secret_access_key=config["BEDROCK_AWS_SECRET_ACCESS_KEY"],
+            "bedrock-runtime", **self._session_kw,
             config=Config(read_timeout=600, connect_timeout=10,
                           retries={"max_attempts": 3, "mode": "standard"}),
         )
 
+    # --- parametri zahtjeva (zajednički za izravne pozive i batch) ---------
+    def _parametri(self, model_id: str, max_tokens: int, temperature: float,
+                   effort: str | None) -> tuple[int, float | None, str | None]:
+        mt = max_tokens + (THINKING_HEADROOM if model_id in self._uvijek_razmislja else 0)
+        temp = None if model_id in self._bez_temperature else temperature
+        eff = None if model_id in self._bez_efforta else effort
+        return mt, temp, eff
+
     def _converse(self, model_id: str, system_prompt: str, user_message: str,
-                  max_tokens: int, temperature: float) -> str:
+                  max_tokens: int, temperature: float, effort: str | None = None) -> str:
         from botocore.exceptions import ClientError
 
         last_err = None
@@ -738,17 +768,18 @@ class BedrockClient:
                 # dugi system prompt (pravila, template, checklista) je isti za
                 # sve proizvode iste kategorije: prompt caching
                 system.append({"cachePoint": {"type": "default"}})
-            cfg = {"maxTokens": max_tokens}
-            if model_id not in self._bez_temperature:
-                cfg["temperature"] = temperature
-            if model_id in self._uvijek_razmislja:
-                # thinking se naplaćuje kao izlaz i troši maxTokens
-                cfg["maxTokens"] = max_tokens + THINKING_HEADROOM
+            mt, temp, eff = self._parametri(model_id, max_tokens, temperature, effort)
+            cfg = {"maxTokens": mt}
+            if temp is not None:
+                cfg["temperature"] = temp
+            kw = {}
+            if eff:
+                kw["additionalModelRequestFields"] = {"output_config": {"effort": eff}}
             try:
                 resp = self._client.converse(
                     modelId=model_id, system=system,
                     messages=[{"role": "user", "content": [{"text": user_message}]}],
-                    inferenceConfig=cfg,
+                    inferenceConfig=cfg, **kw,
                 )
                 self._zabiljezi(model_id, resp.get("usage") or {})
                 blocks = resp["output"]["message"]["content"]
@@ -766,6 +797,11 @@ class BedrockClient:
                 if code == "ValidationException" and "temperature" in msg.lower() \
                         and model_id not in self._bez_temperature:
                     self._bez_temperature.add(model_id)
+                    continue
+                # model koji ne prima effort: bez njega
+                if code == "ValidationException" and eff and \
+                        ("effort" in msg.lower() or "output_config" in msg.lower()):
+                    self._bez_efforta.add(model_id)
                     continue
                 if code in {"ThrottlingException", "ServiceUnavailableException",
                             "InternalServerException", "ModelNotReadyException",
@@ -793,18 +829,237 @@ class BedrockClient:
         with self._usage_lock:
             return json.loads(json.dumps(self._usage_dretve.get(threading.get_ident(), {})))
 
+    # --- javno sučelje -------------------------------------------------------
+    def _poziv(self, vrsta: str, model_id: str, system_prompt: str, user_message: str,
+               max_tokens: int, temperature: float) -> str:
+        return self._converse(model_id, system_prompt, user_message, max_tokens,
+                              temperature, self.effort.get(vrsta))
+
     def generate(self, system_prompt: str, user_message: str,
                  model_id: str | None = None) -> str:
-        return self._converse(model_id or self.model_id, system_prompt, user_message,
-                              GEN_MAX_TOKENS, GEN_TEMPERATURE)
+        return self._poziv("generate", model_id or self.model_id, system_prompt,
+                           user_message, GEN_MAX_TOKENS, GEN_TEMPERATURE)
 
     def verify(self, system_prompt: str, user_message: str) -> str:
-        return self._converse(self.verify_model_id, system_prompt, user_message,
-                              VERIFY_MAX_TOKENS, VERIFY_TEMPERATURE)
+        return self._poziv("verify", self.verify_model_id, system_prompt, user_message,
+                           VERIFY_MAX_TOKENS, VERIFY_TEMPERATURE)
 
     def extract(self, system_prompt: str, user_message: str) -> str:
-        return self._converse(self.model_id, system_prompt, user_message,
-                              EXTRACT_MAX_TOKENS, 0.0)
+        return self._poziv("extract", self.model_id, system_prompt, user_message,
+                           EXTRACT_MAX_TOKENS, 0.0)
+
+    # batch sučelje (BatchClient); izravni klijent ih ignorira
+    def pocni(self) -> None:
+        pass
+
+    def zavrsi(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Bedrock batch inference (pola cijene)
+# ---------------------------------------------------------------------------
+
+class BatchClient(BedrockClient):
+    """Isti pipeline, ali pozivi svih proizvoda koji čekaju skupljaju se u
+    krugove: svaki proizvod radi u svojoj dretvi, a kad sve aktivne dretve
+    čekaju odgovor modela, krug se šalje odjednom.
+
+    Krug s barem BATCH_MIN zahtjeva za isti model ide kao Bedrock batch job
+    (CreateModelInvocationJob: JSONL u S3, pola cijene, bez prompt cachinga);
+    manji krugovi i zapisi koje batch nije obradio idu izravnim pozivima.
+    Bedrock batch traži najmanje 100 zapisa po jobu."""
+
+    def __init__(self, config: dict, effort: dict[str, str] | None = None,
+                 min_zapisa: int = None, poll_s: int = 60, izravno_paralelno: int = 8,
+                 bedrock=None, s3=None):
+        super().__init__(config, effort)
+        import boto3
+
+        self.min_zapisa = min_zapisa or BATCH_MIN
+        self.poll_s = poll_s
+        self.izravno_paralelno = izravno_paralelno
+        self.role_arn = config["BEDROCK_BATCH_ROLE_ARN"]
+        uri = config["BEDROCK_BATCH_S3"].rstrip("/")
+        if not uri.startswith("s3://") or not self.role_arn:
+            raise ValueError("Batch traži BEDROCK_BATCH_ROLE_ARN i BEDROCK_BATCH_S3 "
+                             "(s3://bucket/prefiks) u .env — vidi docs/BATCH_SETUP.md")
+        self.bucket, _, self.prefix = uri[5:].partition("/")
+        self._bedrock = bedrock or boto3.client("bedrock", **self._session_kw)
+        self._s3 = s3 or boto3.client("s3", **self._session_kw)
+        self._uvjet = threading.Condition()
+        self._aktivni = 0
+        self._cekaju: list[dict] = []
+        self._koordinator = threading.Thread(target=self._petlja, daemon=True)
+        self._radi = True
+        self.statistika = {"batch_jobova": 0, "batch_zapisa": 0, "izravnih": 0}
+        self._koordinator.start()
+
+    # dretva proizvoda: prijava i odjava (koordinator čeka samo aktivne)
+    def pocni(self) -> None:
+        with self._uvjet:
+            self._aktivni += 1
+
+    def zavrsi(self) -> None:
+        with self._uvjet:
+            self._aktivni -= 1
+            self._uvjet.notify_all()
+
+    def zatvori(self) -> None:
+        with self._uvjet:
+            self._radi = False
+            self._uvjet.notify_all()
+
+    def _poziv(self, vrsta, model_id, system_prompt, user_message, max_tokens, temperature):
+        zahtjev = {"vrsta": vrsta, "model": model_id, "system": system_prompt,
+                   "user": user_message, "max_tokens": max_tokens,
+                   "temperature": temperature, "effort": self.effort.get(vrsta),
+                   "dretva": threading.get_ident(), "gotovo": threading.Event(),
+                   "odgovor": None, "greska": None}
+        with self._uvjet:
+            self._cekaju.append(zahtjev)
+            self._uvjet.notify_all()
+        zahtjev["gotovo"].wait()
+        if zahtjev["greska"] is not None:
+            raise zahtjev["greska"]
+        return zahtjev["odgovor"]
+
+    def _petlja(self) -> None:
+        while True:
+            with self._uvjet:
+                # krug kreće kad svi aktivni proizvodi čekaju odgovor
+                while self._radi and not (self._cekaju and len(self._cekaju) >= self._aktivni):
+                    self._uvjet.wait(timeout=5)
+                if not self._radi and not self._cekaju:
+                    return
+                krug, self._cekaju = self._cekaju, []
+            self._obradi_krug(krug)
+
+    def _obradi_krug(self, krug: list[dict]) -> None:
+        po_modelu: dict[str, list[dict]] = {}
+        for z in krug:
+            po_modelu.setdefault(z["model"], []).append(z)
+        izravno = []
+        for model, zahtjevi in po_modelu.items():
+            if len(zahtjevi) >= self.min_zapisa:
+                try:
+                    izravno += self._batch_job(model, zahtjevi)
+                except Exception as err:  # noqa: BLE001 — batch ne smije srušiti run
+                    print(f"  [batch] job nije uspio ({err}); zahtjevi idu izravno")
+                    izravno += zahtjevi
+            else:
+                izravno += zahtjevi
+        self._izravno(izravno)
+
+    def _izravno(self, zahtjevi: list[dict]) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def jedan(z):
+            try:
+                odg = BedrockClient._poziv(self, z["vrsta"], z["model"], z["system"],
+                                           z["user"], z["max_tokens"], z["temperature"])
+                self._zapisi_dretvi(z, None)
+                z["odgovor"] = odg
+            except Exception as err:  # noqa: BLE001
+                z["greska"] = err
+            finally:
+                z["gotovo"].set()
+
+        self.statistika["izravnih"] += len(zahtjevi)
+        with ThreadPoolExecutor(max_workers=self.izravno_paralelno) as ex:
+            list(ex.map(jedan, zahtjevi))
+
+    def _zapisi_dretvi(self, z: dict, usage: dict | None, model_kljuc: str | None = None):
+        """Izravni poziv bilježi potrošnju u dretvu koordinatora; prebaci je u
+        dretvu proizvoda (trošak po proizvodu)."""
+        moja = threading.get_ident()
+        with self._usage_lock:
+            if usage is not None:
+                kljuc = model_kljuc or z["model"]
+                for cilj in (self.usage, self._usage_dretve.setdefault(z["dretva"], {})):
+                    u = cilj.setdefault(kljuc, {"input": 0, "output": 0, "cache_read": 0,
+                                                "cache_write": 0, "poziva": 0})
+                    u["poziva"] += 1
+                    u["input"] += int(usage.get("input_tokens") or 0)
+                    u["output"] += int(usage.get("output_tokens") or 0)
+                return
+            izvor = self._usage_dretve.pop(moja, {})
+            cilj = self._usage_dretve.setdefault(z["dretva"], {})
+            for m, u in izvor.items():
+                c = cilj.setdefault(m, {k: 0 for k in u})
+                for k, v in u.items():
+                    c[k] = c.get(k, 0) + v
+
+    def _tijelo(self, z: dict) -> dict:
+        mt, temp, eff = self._parametri(z["model"], z["max_tokens"], z["temperature"],
+                                        z["effort"])
+        tijelo = {"anthropic_version": "bedrock-2023-05-31", "max_tokens": mt,
+                  "system": z["system"],
+                  "messages": [{"role": "user",
+                                "content": [{"type": "text", "text": z["user"]}]}]}
+        if temp is not None:
+            tijelo["temperature"] = temp
+        if eff:
+            tijelo["output_config"] = {"effort": eff}
+        return tijelo
+
+    def _batch_job(self, model: str, zahtjevi: list[dict]) -> list[dict]:
+        """Pošalji jedan Bedrock batch job; vrati zahtjeve koje batch nije riješio."""
+        oznaka = f"pdp-{dt.datetime.now():%Y%m%d-%H%M%S}-{random.randint(1000, 9999)}"
+        osnova = f"{self.prefix}/{oznaka}".strip("/")
+        po_id = {f"r{i:06d}": z for i, z in enumerate(zahtjevi)}
+        jsonl = "\n".join(json.dumps({"recordId": rid, "modelInput": self._tijelo(z)},
+                                     ensure_ascii=False) for rid, z in po_id.items())
+        self._s3.put_object(Bucket=self.bucket, Key=f"{osnova}/input.jsonl",
+                            Body=jsonl.encode("utf-8"))
+        job = self._bedrock.create_model_invocation_job(
+            jobName=oznaka, roleArn=self.role_arn, modelId=model,
+            inputDataConfig={"s3InputDataConfig": {
+                "s3Uri": f"s3://{self.bucket}/{osnova}/input.jsonl"}},
+            outputDataConfig={"s3OutputDataConfig": {
+                "s3Uri": f"s3://{self.bucket}/{osnova}/output/"}})
+        arn = job["jobArn"]
+        print(f"  [batch] {len(zahtjevi)} zahtjeva → {model} ({oznaka})")
+        while True:
+            st = self._bedrock.get_model_invocation_job(jobIdentifier=arn)
+            status = st["status"]
+            if status in ("Completed", "PartiallyCompleted", "Failed", "Stopped", "Expired"):
+                break
+            time.sleep(self.poll_s)
+        self.statistika["batch_jobova"] += 1
+        rijeseni = set()
+        if status in ("Completed", "PartiallyCompleted"):
+            out_prefix = f"{osnova}/output/"
+            stranice = self._s3.get_paginator("list_objects_v2").paginate(
+                Bucket=self.bucket, Prefix=out_prefix)
+            for stranica in stranice:
+                for obj in stranica.get("Contents", []):
+                    if not obj["Key"].endswith(".jsonl.out"):
+                        continue
+                    tekst = self._s3.get_object(Bucket=self.bucket,
+                                                Key=obj["Key"])["Body"].read().decode("utf-8")
+                    for redak in tekst.splitlines():
+                        if not redak.strip():
+                            continue
+                        r = json.loads(redak)
+                        z = po_id.get(r.get("recordId"))
+                        izlaz = r.get("modelOutput") or {}
+                        if z is None or r.get("error") or not izlaz.get("content"):
+                            continue
+                        z["odgovor"] = "".join(b.get("text", "") for b in izlaz["content"]
+                                               if b.get("type") == "text").strip()
+                        self._zapisi_dretvi(z, izlaz.get("usage") or {},
+                                            model_kljuc=f"{model}{BATCH_SUFIKS}")
+                        z["gotovo"].set()
+                        rijeseni.add(r["recordId"])
+        self.statistika["batch_zapisa"] += len(rijeseni)
+        print(f"  [batch] {oznaka}: {status}, riješeno {len(rijeseni)}/{len(zahtjevi)}")
+        return [z for rid, z in po_id.items() if rid not in rijeseni]
+
+
+def batch_spreman(config: dict) -> bool:
+    return bool(config.get("BEDROCK_BATCH_ROLE_ARN")) and \
+        str(config.get("BEDROCK_BATCH_S3", "")).startswith("s3://")
 
 
 def explain_client_error(err, config: dict) -> str:

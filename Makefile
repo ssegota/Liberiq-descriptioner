@@ -18,6 +18,7 @@ setup:          ## venv, ovisnosti i .env iz predloška
 
 test:           ## offline testovi (bez Bedrocka i mreže)
 	$(PY) test_v4.py
+	$(PY) test_batch.py
 	$(PY) test_upute.py
 	$(PY) test_klijent.py
 	$(PY) test_all.py

@@ -107,6 +107,12 @@ Run se može prekinuti i nastaviti — svaki obrađeni proizvod odmah se zapisuj
 | `--search-results 3` | broj usporednih izvora (Vaše zdravlje, Prima Pharme…) |
 | `--pim-dir mapa` | HR ambalaža / deklaracija / PIM po proizvodu (SKU ili EAN u nazivu datoteke) |
 | `--workers 4` | koliko proizvoda se obrađuje istodobno |
+| `--rescue-model …` | model za dodatne pokušaje kad pisac ne prođe kontrolu (zadano Opus 5.5; `""` isključuje) |
+| `--rescue-attempts 2` | broj dodatnih pokušaja tim modelom |
+| `--batch auto\|on\|off` | Bedrock batch, pola cijene; `auto` = za 100+ proizvoda kad je postavljen ([docs/BATCH_SETUP.md](docs/BATCH_SETUP.md)) |
+| `--effort-extract low` | razmišljanje za klasifikaciju i ekstrakciju (`low`/`medium`/`high`/`off`) |
+| `--effort-generate medium` | razmišljanje za pisanje opisa i SEO |
+| `--effort-verify medium` | razmišljanje za stručnu provjeru |
 | `--no-secondary` | bez stranice brenda i usporednih izvora |
 | `--no-web-search` | samo stranica proizvoda |
 | `--no-fetch` | bez dohvaćanja išta (samo naziv iz tablice) |

@@ -150,6 +150,7 @@ PDP_COLS = ["Kategorija predloška", "Podvrsta", "Klasifikacija", "Status",
 
 
 GRESKE = (P.STATUS_STOP, "GREŠKA")
+BATCH_VAL = 1000      # proizvoda istodobno u batch načinu (dretve većinom čekaju)
 
 # Stupci koji su služili samo statusu „TREBA PROVJERA” (ukinut 31. 10. 2026.);
 # ostaju u results.jsonl za dijagnostiku, ali ne idu u tablice.
@@ -350,9 +351,19 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-attempts", type=int, default=4)
     ap.add_argument("--rescue-model", default=None,
                     help="model za dodatne pokušaje kad osnovni ne prođe kontrolu "
-                         "(npr. eu.anthropic.claude-opus-5-5; zadano BEDROCK_RESCUE_MODEL_ID)")
+                         f"(zadano BEDROCK_RESCUE_MODEL_ID ili {P.DEFAULT_RESCUE_MODEL}; "
+                         "\"\" isključuje)")
     ap.add_argument("--rescue-attempts", type=int, default=2,
                     help="broj dodatnih pokušaja modelom za spašavanje (zadano 2)")
+    ap.add_argument("--batch", choices=["auto", "on", "off"], default="auto",
+                    help="Bedrock batch (pola cijene): auto = za 100+ proizvoda ako je "
+                         "postavljen (BEDROCK_BATCH_ROLE_ARN, BEDROCK_BATCH_S3)")
+    ap.add_argument("--effort-extract", default=P.DEFAULT_EFFORT["extract"],
+                    help="razmišljanje za klasifikaciju i ekstrakciju (low/medium/high/off)")
+    ap.add_argument("--effort-generate", default=P.DEFAULT_EFFORT["generate"],
+                    help="razmišljanje za pisanje opisa i SEO (low/medium/high/off)")
+    ap.add_argument("--effort-verify", default=P.DEFAULT_EFFORT["verify"],
+                    help="razmišljanje za stručnu provjeru (low/medium/high/off)")
     ap.add_argument("--workers", type=int, default=1,
                     help="broj proizvoda koji se obrađuju istodobno (zadano 1)")
     ap.add_argument("--strogo", action="store_true",
@@ -442,16 +453,8 @@ def main() -> None:
         return
 
     config = P.load_bedrock_config()
-    client = P.BedrockClient(config)          # isti klijent za oba alata
     if args.rescue_model is not None:
-        client.rescue_model_id = args.rescue_model
-    print(f"Model (pisac):     {client.model_id}")
-    print(f"Model (kontrolor): {client.verify_model_id}")
-    if client.rescue_model_id:
-        print(f"Model (dodatni pokušaji): {client.rescue_model_id} "
-              f"(+{args.rescue_attempts})")
-    print(f"Regija:            {config['BEDROCK_AWS_REGION']}\n")
-
+        config["BEDROCK_RESCUE_MODEL_ID"] = args.rescue_model
     done = {} if args.force else load_done(jsonl_path)
     if args.retry_review:
         # ponavljaju se samo retci s greškom (TREBA PROVJERA više ne postoji)
@@ -462,6 +465,28 @@ def main() -> None:
     if len(products) - len(todo):
         print(f"Preskačem {len(products) - len(todo)} već obrađenih "
               "(results.jsonl; --force za ponovno).")
+
+    # Bedrock batch (pola cijene): automatski od BATCH_MIN proizvoda nadalje
+    effort = {"extract": args.effort_extract, "generate": args.effort_generate,
+              "verify": args.effort_verify}
+    effort = {k: v for k, v in effort.items() if v and v != "off"}
+    batch = args.batch == "on" or (args.batch == "auto" and len(todo) >= P.BATCH_MIN)
+    if batch and not P.batch_spreman(config):
+        print(f"Batch: {len(todo)} proizvoda, ali BEDROCK_BATCH_ROLE_ARN / BEDROCK_BATCH_S3 "
+              "nisu postavljeni (docs/BATCH_SETUP.md) — izravni pozivi.")
+        if args.batch == "on":
+            sys.exit(1)
+        batch = False
+    client = (P.BatchClient(config, effort) if batch
+              else P.BedrockClient(config, effort))   # isti klijent za oba alata
+    print(f"Model (pisac):     {client.model_id}")
+    print(f"Model (kontrolor): {client.verify_model_id}")
+    if client.rescue_model_id:
+        print(f"Model (dodatni pokušaji): {client.rescue_model_id} "
+              f"(+{args.rescue_attempts})")
+    print(f"Razmišljanje:      {', '.join(f'{k} {v}' for k, v in effort.items()) or 'zadano'}")
+    print(f"Način:             {'Bedrock batch (pola cijene)' if batch else 'izravni pozivi'}")
+    print(f"Regija:            {config['BEDROCK_AWS_REGION']}\n")
 
     lock = threading.Lock()
     seen_titles: set[str] = set()
@@ -576,8 +601,27 @@ def main() -> None:
         print(f"[{idx}/{len(todo)}] {p.sku} {p.naziv[:40]:<40} -> "
               f"{' | '.join(bits)}")
 
+    def obradi_batch(idx: int, p) -> None:
+        try:
+            obradi(idx, p)
+        finally:
+            client.zavrsi()
+
     try:
-        if args.workers <= 1:
+        if batch:
+            # svi proizvodi vala rade istodobno; njihovi pozivi modelu skupljaju
+            # se u krugove koje BatchClient šalje kao batch jobove
+            from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+            for start in range(0, len(todo), BATCH_VAL):
+                val = list(enumerate(todo, start=1))[start:start + BATCH_VAL]
+                for _ in val:
+                    client.pocni()
+                with ThreadPoolExecutor(max_workers=len(val)) as ex:
+                    for fut in [ex.submit(obradi_batch, idx, p) for idx, p in val]:
+                        fut.result()
+            client.zatvori()
+            print(f"Batch: {client.statistika}")
+        elif args.workers <= 1:
             for idx, p in enumerate(todo, start=1):
                 obradi(idx, p)
         else:
