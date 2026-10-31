@@ -661,6 +661,8 @@ def load_bedrock_config() -> dict:
     missing = [key for key, value in config.items() if not value]
     if missing:
         sys.exit(f"Nedostaje u .env: {', '.join(missing)}")
+    # model za dodatne pokušaje kad osnovni model ne prođe kontrolu (npr. Opus)
+    config["BEDROCK_RESCUE_MODEL_ID"] = os.getenv("BEDROCK_RESCUE_MODEL_ID", "")
     config["BEDROCK_VERIFY_MODEL_ID"] = (os.getenv("BEDROCK_VERIFY_MODEL_ID")
                                          or config["BEDROCK_TEXT_MODEL_ID"])
     return config
@@ -673,6 +675,7 @@ class BedrockClient:
 
         self.model_id = config["BEDROCK_TEXT_MODEL_ID"]
         self.verify_model_id = config["BEDROCK_VERIFY_MODEL_ID"]
+        self.rescue_model_id = config.get("BEDROCK_RESCUE_MODEL_ID") or ""
         self._cache_ok = True
         self._client = boto3.client(
             "bedrock-runtime",
@@ -719,8 +722,9 @@ class BedrockClient:
                 raise
         raise last_err  # type: ignore[misc]
 
-    def generate(self, system_prompt: str, user_message: str) -> str:
-        return self._converse(self.model_id, system_prompt, user_message,
+    def generate(self, system_prompt: str, user_message: str,
+                 model_id: str | None = None) -> str:
+        return self._converse(model_id or self.model_id, system_prompt, user_message,
                               GEN_MAX_TOKENS, GEN_TEMPERATURE)
 
     def verify(self, system_prompt: str, user_message: str) -> str:
@@ -1594,6 +1598,7 @@ def process_product(product: Product, category: str, sources: list[Source],
                     client, max_attempts: int, do_verify: bool = True,
                     do_extract: bool = True, do_coverage: bool = True,
                     podvrsta: str = "", zauzeti_poceci: list[str] | None = None,
+                    rescue_attempts: int = 2,
                     ) -> tuple[RowResult, str]:
     letter = category
     podvrsta = podvrsta or T.podvrsta_heuristika(letter, product.naziv)
@@ -1671,11 +1676,34 @@ def process_product(product: Product, category: str, sources: list[Source],
         if score > best_score:
             best_md, best_issues, best_score, best_json = md_text, list(issues), score, js
 
-    for attempt in range(1, max_attempts + 1):
+    # plan pokušaja: osnovni model, zatim dodatni pokušaji modelom za
+    # spašavanje (npr. Opus), koji dobiva najbolju dosadašnju verziju i sve
+    # dosad nađene greške te svaku ispravlja uz provjeru u izvorima
+    rescue = getattr(client, "rescue_model_id", "") or ""
+    plan = [None] * max_attempts + ([rescue] * rescue_attempts if rescue else [])
+    ukupno = len(plan)
+    svi_problemi: list[str] = []
+    for attempt, model in enumerate(plan, start=1):
         result.attempts = attempt
+        if model and best_md:
+            if attempt == max_attempts + 1:
+                result.info.append(f"dodatni pokušaj modelom {model}")
+            fb = ("Ovo je dodatni pokušaj. Ispod je NAJBOLJA DOSADAŠNJA VERZIJA opisa i "
+                  "popis SVIH grešaka koje su automatska kontrola i stručna provjera "
+                  "dosad našle. Za svaku grešku pronađi odgovarajući podatak u izvorima "
+                  "([Sx]) i ispravi ga; ako podatka nema u izvorima, izostavi tvrdnju "
+                  "(ili, ako je obvezan, ostavi prazno uz [PROVJERITI: naziv]). Ne uvodi "
+                  "nove podatke. Vrati cijeli ispravljeni dokument i JSON blok.\n\n"
+                  "SVE DOSAD NAĐENE GREŠKE:\n"
+                  + "\n".join(f"- {i}" for i in dict.fromkeys(svi_problemi))
+                  + (f"\n\nZADNJA PROVJERA:\n{feedback}" if feedback else "")
+                  + f"\n\nNAJBOLJA DOSADAŠNJA VERZIJA:\n<<<PDP\n{best_md}PDP>>>")
+        else:
+            fb = feedback
         raw = client.generate(system_prompt,
                               build_gen_user(product, letter, podvrsta, sources,
-                                             feedback, inventory, upute))
+                                             fb, inventory, upute),
+                              **({"model_id": model} if model else {}))
         raw, interni = odvoji_json_blok(raw)
         md = clean_markdown(raw)
         md = R.ukloni_crtice(md)
@@ -1689,6 +1717,7 @@ def process_product(product: Product, category: str, sources: list[Source],
                               procjena, upute,
                               inventory.meta if inventory is not None else {})
         if errors:
+            svi_problemi.extend(errors)
             consider(md, errors, 0, interni)
             feedback = ("Greške automatske kontrole (pravila templatea i checkliste):\n"
                         + "\n".join(f"- {e}" for e in errors))
@@ -1697,6 +1726,7 @@ def process_product(product: Product, category: str, sources: list[Source],
         if do_coverage and inventory is not None:
             gaps = X.coverage_check(inventory, md)
             if gaps:
+                svi_problemi.extend(gaps)
                 result.coverage = gaps
                 consider(md, gaps, 1, interni)
                 feedback = ("Podaci koji POSTOJE u izvorima nisu preneseni u opis. "
@@ -1719,8 +1749,9 @@ def process_product(product: Product, category: str, sources: list[Source],
                 # piscu jednom, a zatim bilježe kao napomena
                 blokira = [i for i, g in zip(issues, verdict["greske"])
                            if "pisanje" not in str(g.get("vrsta", "")).lower()]
-                if blokira or (not stil_krug and attempt < max_attempts):
+                if blokira or (not stil_krug and attempt < ukupno):
                     stil_krug = stil_krug or not blokira
+                    svi_problemi.extend(issues)
                     consider(md, issues, 2, interni)
                     result.verified = "ne prolazi"
                     feedback = ("Stručna provjera (drugi agent) našla je greške. "

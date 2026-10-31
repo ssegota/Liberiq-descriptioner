@@ -171,6 +171,28 @@ check("PDP: tablica izvora dodana na kraj",
       "## Izvori (ne objavljuje se)" in md and "sastav, doza, EAN" in md)
 check("PDP: JSON blok nije u dokumentu", "```json" not in md)
 
+
+
+class RescueClient(MockClient):
+    rescue_model_id = "mock-opus"
+
+    def generate(self, system, user, model_id=None):
+        if "KOSTUR IZLAZNOG FORMATA" in user:
+            self.calls.append(model_id or "osnovni")
+            if model_id == "mock-opus":
+                assert "SVE DOSAD NAĐENE GREŠKE" in user and "NAJBOLJA DOSADAŠNJA" in user
+                return GOOD_PDP + PDP_JSON
+            return GOOD_PDP.replace("Važno je pridržavati se", "Zahvaljujući tome, važno je "
+                                    "pridržavati se") + PDP_JSON
+        return SEO_JSON
+
+
+rc = RescueClient()
+res_r, md_r = P.process_product(PROD, letter, sources, rc, 2, True, podvrsta=podvrsta)
+check("dodatni pokušaj Opusom: osnovni model 2× pao, Opus ispravio",
+      rc.calls.count("osnovni") == 2 and rc.calls.count("mock-opus") == 1
+      and res_r.status == P.STATUS_PROVJERITI, f"({res_r.status}, {rc.calls})")
+
 seo_res = S.process_product(PROD, page, client, set(), set(), threading.Lock(), 2,
                             canonical_name=A.canonical_name_from_md(md),
                             dodatne_upute=A.seo_upute(letter, podvrsta, md))

@@ -319,6 +319,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--sku", action="append", default=[])
     ap.add_argument("--max-attempts", type=int, default=4)
+    ap.add_argument("--rescue-model", default=None,
+                    help="model za dodatne pokušaje kad osnovni ne prođe kontrolu "
+                         "(npr. eu.anthropic.claude-opus-5-5; zadano BEDROCK_RESCUE_MODEL_ID)")
+    ap.add_argument("--rescue-attempts", type=int, default=2,
+                    help="broj dodatnih pokušaja modelom za spašavanje (zadano 2)")
     ap.add_argument("--workers", type=int, default=1,
                     help="broj proizvoda koji se obrađuju istodobno (zadano 1)")
     ap.add_argument("--strogo", action="store_true",
@@ -408,8 +413,13 @@ def main() -> None:
 
     config = P.load_bedrock_config()
     client = P.BedrockClient(config)          # isti klijent za oba alata
+    if args.rescue_model is not None:
+        client.rescue_model_id = args.rescue_model
     print(f"Model (pisac):     {client.model_id}")
     print(f"Model (kontrolor): {client.verify_model_id}")
+    if client.rescue_model_id:
+        print(f"Model (dodatni pokušaji): {client.rescue_model_id} "
+              f"(+{args.rescue_attempts})")
     print(f"Regija:            {config['BEDROCK_AWS_REGION']}\n")
 
     done = {} if args.force else load_done(jsonl_path)
@@ -482,7 +492,8 @@ def main() -> None:
                 do_extract=not args.no_extract,
                 do_coverage=not args.no_coverage,
                 podvrsta=podvrsta,
-                zauzeti_poceci=list(zauzeti.get(cat, [])))
+                zauzeti_poceci=list(zauzeti.get(cat, [])),
+                rescue_attempts=args.rescue_attempts)
             pdp_res.klasifikacija = razlog
             canonical = canonical_name_from_md(md)
             if pdp_res.prva_recenica:
