@@ -133,8 +133,12 @@ check("izravni poziv bilježi se po proizvodu",
       str(troskovi.get(3)))
 cijena_batch = P.trosak_usd(troskovi[7])
 cijena_izravno = P.trosak_usd(troskovi[3])
-check("batch je pola cijene", abs(cijena_batch * 2 - cijena_izravno) < 1e-9,
+check("batch je pola cijene (EU profil +10 % u oba)", abs(cijena_batch * 2 - cijena_izravno) < 1e-9,
       f"({cijena_batch:.4f} vs {cijena_izravno:.4f})")
+
+check("EU profil 10 % skuplji od globalnog",
+      abs(P.trosak_usd({"eu.anthropic.claude-sonnet-4-6": {"input": 1_000_000}}) - 3.30) < 1e-9
+      and abs(P.trosak_usd({"global.anthropic.claude-sonnet-4-6": {"input": 1_000_000}}) - 3.00) < 1e-9)
 
 # mali krug (< 100) ide izravno
 c2 = TestBatchClient(CONFIG, poll_s=0, bedrock=FakeBedrock(s3), s3=s3)

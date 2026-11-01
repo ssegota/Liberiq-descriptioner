@@ -74,9 +74,11 @@ BATCH_SUFIKS = "#batch"       # ključ potrošnje za batch (pola cijene, bez cac
 # modeli koji ne primaju temperature i uvijek razmišljaju
 NOVI_MODEL_RE = re.compile(r"opus-(4-[78]|5)|sonnet-5|fable|mythos")
 
-# USD po milijunu tokena: ulaz, izlaz, čitanje iz cachea, upis u cache.
-# Cjenik Anthropica (listopad 2026.); Bedrock je partnerski cjenik, provjeriti
-# na aws.amazon.com/bedrock/pricing prije ponude klijentu.
+# USD po milijunu tokena: ulaz, izlaz, čitanje iz cachea, upis u cache (5 min).
+# Bedrock cjenik za eu-central-1 (AWS Price List, AmazonBedrockFoundationModels,
+# objava 12. 10. 2026.): cijene „Global” profila (global.anthropic.*) jednake su
+# Anthropicovima; regionalni profili (eu.anthropic.*, koje generator koristi)
+# skuplji su 10 % (REGIONALNI_FAKTOR). Batch = pola cijene, bez prompt cachinga.
 CIJENE = {
     "opus-5-5": (4.00, 20.00, 0.20, 5.00),
     "opus-5": (5.00, 25.00, 0.50, 6.25),
@@ -88,12 +90,20 @@ CIJENE = {
 }
 
 
+REGIONALNI_FAKTOR = 1.10
+REGIONALNI_PREFIKSI = ("eu.", "us.", "apac.", "jp.", "au.", "ca.")
+# Modeli koji u eu-central-1 imaju batch cijenu (Opus 5.5 je nema).
+BATCH_MODEL_RE = re.compile(r"sonnet|haiku")
+
+
 def trosak_usd(usage: dict[str, dict[str, int]]) -> float:
     """Trošak u USD za {model: {input, output, cache_read, cache_write}}.
     Ključ s BATCH_SUFIKS = Bedrock batch: pola cijene izravnog poziva."""
     ukupno = 0.0
     for model, u in usage.items():
         faktor = 0.5 if model.endswith(BATCH_SUFIKS) else 1.0
+        if model.startswith(REGIONALNI_PREFIKSI):
+            faktor *= REGIONALNI_FAKTOR
         cijena = next((v for k, v in sorted(CIJENE.items(), key=lambda x: -len(x[0]))
                        if k in model), None)
         if cijena is None:
@@ -941,7 +951,7 @@ class BatchClient(BedrockClient):
             po_modelu.setdefault(z["model"], []).append(z)
         izravno = []
         for model, zahtjevi in po_modelu.items():
-            if len(zahtjevi) >= self.min_zapisa:
+            if len(zahtjevi) >= self.min_zapisa and BATCH_MODEL_RE.search(model):
                 try:
                     izravno += self._batch_job(model, zahtjevi)
                 except Exception as err:  # noqa: BLE001 — batch ne smije srušiti run
