@@ -248,6 +248,10 @@ check("coverage: izgubljen INCI i EAN", len(X.coverage_check(inv, "# X\n")) == 2
 check("coverage: potpun opis prolazi",
       X.coverage_check(inv, "INCI: Aqua, Glycerin, Niacinamide\n| EAN | 3337875863377 |") == [])
 check("neispravan JSON", not X.parse_inventory("nije json", "A").ok)
+check("JSON s hrvatskim navodnicima se popravlja",
+      X.parse_inventory('{"cinjenice": [{"polje": "ispitivanja", "vrijednost": '
+                        '"ocijenila je s „vrlo dobrim" ili „odličnim".", "status": "FOUND"}]}',
+                        "B").ok)
 
 print("\n=== Izlaz: crvene oznake, tablica izvora, EAN ===")
 check("oznake za provjeru izvučene",

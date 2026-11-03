@@ -149,7 +149,7 @@ datoteka), plus zbirni **Ukupni status**.
 | Status | Značenje |
 | --- | --- |
 | `OK` | prošlo sve kontrole i stručnu provjeru, bez crvenih oznaka |
-| `OK, PROVJERITI CRVENO` | prošlo sve; crveno označene podatke provjeriti na ambalaži prije objave |
+| `OK, PROVJERITI NESIGURNOSTI` | prošlo sve; crveno označene podatke provjeriti na ambalaži prije objave |
 | `ZAUSTAVLJENO` | zabranjena biljna vrsta (NN 160/2013, Prilog III.) |
 | `GREŠKA EKSTRAKCIJE` | nije moguće pouzdano izvući strukturirana polja |
 | `GREŠKA` | nema stranice proizvoda na eLjekarni24 |

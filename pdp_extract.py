@@ -291,9 +291,26 @@ IZVORI>>>
 Izvuci inventar činjenica. Vrati samo JSON."""
 
 
-def _parse_json(text: str, key: str) -> dict | None:
+# Hrvatski navodnici: model otvori „ a zatvori običnim " pa prekine JSON string.
+NAVODNICI_RE = re.compile(r'„([^"„”\n]{0,300})"')
+
+
+def popravi_navodnike(text: str) -> str:
+    """„vrlo dobrim" -> „vrlo dobrim” (zatvarajući navodnik koji ne prekida JSON)."""
+    return NAVODNICI_RE.sub(lambda m: "„" + m.group(1) + "”", text or "")
+
+
+def json_kandidati(text: str) -> list[str]:
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", (text or "").strip(), flags=re.S)
-    for chunk in (cleaned, *re.findall(r"\{.*\}", cleaned, flags=re.S)):
+    out = [cleaned, *re.findall(r"\{.*\}", cleaned, flags=re.S)]
+    popravljeno = popravi_navodnike(cleaned)
+    if popravljeno != cleaned:
+        out += [popravljeno, *re.findall(r"\{.*\}", popravljeno, flags=re.S)]
+    return out
+
+
+def _parse_json(text: str, key: str) -> dict | None:
+    for chunk in json_kandidati(text):
         try:
             parsed = json.loads(chunk)
         except (json.JSONDecodeError, TypeError):

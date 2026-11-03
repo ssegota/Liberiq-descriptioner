@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import threading
 import time
@@ -159,7 +160,7 @@ IZOSTAVLJENI = ("Napomene", "Nesigurnosti", "Nepotkrijepljene tvrdnje", "Verifik
 
 
 def uskladi_status(rec: dict) -> dict:
-    """Bez statusa „TREBA PROVJERA”: OK ili OK, PROVJERITI CRVENO (ima crvenih
+    """Bez statusa „TREBA PROVJERA”: OK ili OK, PROVJERITI NESIGURNOSTI (ima crvenih
     oznaka, nedostajućih obveznih podataka ili regulatornih napomena);
     GREŠKA i ZAUSTAVLJENO ostaju."""
     crveno = any(str(rec.get(k, "")).strip() for k in
@@ -168,6 +169,8 @@ def uskladi_status(rec: dict) -> dict:
         st = str(rec.get(k, "") or "")
         if st and not st.startswith(("OK",) + GRESKE):
             rec[k] = "OK"
+        elif st.startswith("OK,"):              # stari naziv statusa
+            rec[k] = P.STATUS_PROVJERITI
     statusi = [str(rec.get(k)) for k in ("SEO Status", "PDP Status") if rec.get(k)]
     greska = next((g for g in statusi if g.startswith(GRESKE)), None)
     if greska:
@@ -321,7 +324,12 @@ def write_nesigurnosti(records: list[dict], out_dir: Path):
             redci.append({**osnova, "Vrsta": n.get("vrsta", ""), "Gdje": n.get("sekcija", ""),
                           "Polje": n.get("polje", ""), "Podatak": n.get("podatak", ""),
                           "Kontekst": n.get("kontekst", "")})
+        seo_ok = str(r.get("SEO Status", "")).startswith("OK")
         for n in str(r.get("PDP Napomene", "") or "").split(" | "):
+            # meta title i description u opisu zamijenio je SEO alat (provjereno)
+            if seo_ok and re.match(r"(\[\w+\] )?(SEO elementi[^:]*: )?(meta (title|"
+                                   r"description)|Meta (title|description))", n.strip()):
+                continue
             if n.strip():
                 vrsta = ("stručna provjera" if n.startswith("[") else "automatska kontrola")
                 redci.append({**osnova, "Vrsta": f"neriješena napomena ({vrsta})",

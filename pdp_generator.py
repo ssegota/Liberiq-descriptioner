@@ -142,7 +142,9 @@ SECONDARY_LABEL = KIND_BRAND
 TERTIARY_LABEL = KIND_COMPARE
 
 STATUS_OK = "OK"
-STATUS_PROVJERITI = "OK, PROVJERITI CRVENO"
+# opis je gotov; nesigurnosti (podaci za provjeru na ambalaži) su u
+# nesigurnosti.xlsx (ili crvenim oznakama u opisu uz --crvene-oznake)
+STATUS_PROVJERITI = "OK, PROVJERITI NESIGURNOSTI"
 STATUS_REVIEW = "TREBA PROVJERA"
 STATUS_STOP = "ZAUSTAVLJENO"
 
@@ -1338,8 +1340,7 @@ Vrati samo JSON."""
 
 
 def parse_verifier_json(text: str) -> dict | None:
-    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", (text or "").strip(), flags=re.S)
-    for chunk in (cleaned, *re.findall(r"\{.*\}", cleaned, flags=re.S)):
+    for chunk in X.json_kandidati(text):
         try:
             data = json.loads(chunk)
         except (json.JSONDecodeError, TypeError):
