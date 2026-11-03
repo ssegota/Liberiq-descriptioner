@@ -265,6 +265,22 @@ check("JSON odvojen od dokumenta", "```json" not in doc and js["izvori"]["S1"] =
 check("model-ova tablica izvora se uklanja",
       "## Izvori" not in P.clean_markdown(MD + "\n## Izvori\n\n| S1 | x |\n"))
 
+print("\n=== Opis bez crvenih oznaka + nesigurnosti ===")
+nes = P.nesigurnosti(MD)
+check("nesigurnosti: obvezan podatak koji nedostaje",
+      any(n["vrsta"] == P.NESIGURNOST_NEDOSTAJE and n["polje"] == "Zemlja podrijetla" for n in nes))
+check("nesigurnosti: nepotvrđen podatak s mjestom",
+      any(n["podatak"].startswith("Fine Foods") and n["sekcija"].startswith("Tab 5") for n in nes))
+konf = P.nesigurnosti("## Tab 5: X\n\n| Podatak | Vrijednost |\n| --- | --- |\n"
+                      "| Pakiranje | [PROVJERITI: 30 kapsula] / [PROVJERITI: 60 kapsula] |\n")
+check("nesigurnosti: neslaganje izvora", len(konf) == 2 and
+      all(n["vrsta"] == P.NESIGURNOST_NESLAGANJE for n in konf))
+cisto = P.bez_oznaka(MD)
+check("opis bez oznaka", "[PROVJERITI" not in cisto)
+check("prazan obvezan redak izostavljen", "Zemlja podrijetla" not in cisto.split("## Tab 5")[1])
+check("označena vrijednost ostaje kao tekst",
+      "| Proizvođač / subjekt u poslovanju s hranom | Fine Foods & Pharmaceuticals" in cisto)
+
 print("\n=== Scraping eLjekarna24 (BigCommerce) ===")
 html = """<html><body><h1 class="productView-title">NAN 1</h1>
 <div class="productView-info"><dt class="productView-info-name">UPC:</dt>

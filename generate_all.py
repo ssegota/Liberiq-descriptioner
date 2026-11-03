@@ -154,7 +154,7 @@ BATCH_VAL = 1000      # proizvoda istodobno u batch načinu (dretve većinom če
 
 # Stupci koji su služili samo statusu „TREBA PROVJERA” (ukinut 31. 10. 2026.);
 # ostaju u results.jsonl za dijagnostiku, ali ne idu u tablice.
-IZOSTAVLJENI = ("Napomene", "Nepotkrijepljene tvrdnje", "Verifikacija (2. agent)",
+IZOSTAVLJENI = ("Napomene", "Nesigurnosti", "Nepotkrijepljene tvrdnje", "Verifikacija (2. agent)",
                 "Coverage check", "Pokušaji", "Napomena za provjeru", "Informativno")
 
 
@@ -298,6 +298,50 @@ def write_interni_file(records: list[dict], out_dir: Path):
     return xlsx
 
 
+NESIG_COLS = ["Sekcija", "Brend", "SKU", "Naziv", "Template", "Vrsta", "Gdje",
+              "Polje", "Podatak", "Kontekst"]
+
+
+def write_nesigurnosti(records: list[dict], out_dir: Path):
+    """Zaseban izvještaj: svaka nesigurnost iz opisa (prije uklanjanja oznaka),
+    obvezni podaci koji nedostaju i napomene kontrole koje nisu razriješene."""
+    import pandas as pd
+
+    redci = []
+    for r in records:
+        osnova = {"Sekcija": r.get("Sekcija", ""), "Brend": r.get("Brend", ""),
+                  "SKU": r.get("SKU", ""), "Naziv": r.get("Naziv", ""),
+                  "Template": r.get("PDP Kategorija predloška", "")}
+        if str(r.get("Ukupni status", "")).startswith(GRESKE):
+            redci.append({**osnova, "Vrsta": "greška obrade", "Gdje": "",
+                          "Polje": "", "Podatak": r.get("Ukupni status", ""),
+                          "Kontekst": r.get("SEO Napomene", "") or r.get("PDP Napomene", "")})
+            continue
+        for n in json.loads(r.get("PDP Nesigurnosti") or "[]"):
+            redci.append({**osnova, "Vrsta": n.get("vrsta", ""), "Gdje": n.get("sekcija", ""),
+                          "Polje": n.get("polje", ""), "Podatak": n.get("podatak", ""),
+                          "Kontekst": n.get("kontekst", "")})
+        for n in str(r.get("PDP Napomene", "") or "").split(" | "):
+            if n.strip():
+                vrsta = ("stručna provjera" if n.startswith("[") else "automatska kontrola")
+                redci.append({**osnova, "Vrsta": f"neriješena napomena ({vrsta})",
+                              "Gdje": "", "Polje": "", "Podatak": "", "Kontekst": n.strip()})
+        for n in str(r.get("PDP Regulatorno", "") or "").split(" | "):
+            if n.strip():
+                redci.append({**osnova, "Vrsta": "regulatorno", "Gdje": "", "Polje": "",
+                              "Podatak": "", "Kontekst": n.strip()})
+    df = pd.DataFrame(redci, columns=NESIG_COLS)
+    xlsx = out_dir / "nesigurnosti.xlsx"
+    df.to_csv(out_dir / "nesigurnosti.csv", index=False, encoding="utf-8-sig")
+    with pd.ExcelWriter(xlsx, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Nesigurnosti")
+        ws = w.sheets["Nesigurnosti"]
+        for col, width in zip("ABCDEFGHIJ", (14, 14, 11, 40, 24, 30, 30, 26, 40, 80)):
+            ws.column_dimensions[col].width = width
+        ws.freeze_panes = "E2"
+    return xlsx
+
+
 def write_index(records: list[dict], out_dir: Path):
     import pandas as pd
 
@@ -364,6 +408,9 @@ def parse_args() -> argparse.Namespace:
                     help="razmišljanje za pisanje opisa i SEO (low/medium/high/off)")
     ap.add_argument("--effort-verify", default=P.DEFAULT_EFFORT["verify"],
                     help="razmišljanje za stručnu provjeru (low/medium/high/off)")
+    ap.add_argument("--crvene-oznake", action="store_true",
+                    help="zadrži crvene oznake [PROVJERITI] u opisima (zadano: opis bez "
+                         "oznaka, nesigurnosti u nesigurnosti.xlsx)")
     ap.add_argument("--workers", type=int, default=1,
                     help="broj proizvoda koji se obrađuju istodobno (zadano 1)")
     ap.add_argument("--strogo", action="store_true",
@@ -566,6 +613,12 @@ def main() -> None:
             if md.strip() and str(seo_res.status).startswith("OK"):
                 md = ugradi_seo(md, seo_res.title, seo_res.meta)
 
+        nesig = []
+        if pdp_res is not None and md.strip():
+            # nesigurnosti idu u zaseban izvještaj; opis za kupca je bez oznaka
+            nesig = P.nesigurnosti(md)
+            if not args.crvene_oznake:
+                md = P.bez_oznaka(md)
         if pdp_res is not None and md.strip():
             stem = f"PDP_{p.sku}_{P.slugify(p.naziv)}"
             md_path = pdp_dir / f"{stem}.md"
@@ -584,6 +637,7 @@ def main() -> None:
             rec["PDP Template"] = cat
             rec["PDP Prva rečenica"] = pdp_res.prva_recenica
         rec["Trajanje"] = f"{time.time() - t0:.0f} s"
+        rec["PDP Nesigurnosti"] = json.dumps(nesig, ensure_ascii=False)
         poslije = client.usage_dretve()
         potroseno = {m: {k: v - prije.get(m, {}).get(k, 0) for k, v in u.items()}
                      for m, u in poslije.items()}
@@ -647,6 +701,8 @@ def main() -> None:
     xlsx_path, csv_path = write_index(ordered, out_dir)
     klijent_path = write_klijent_file(ordered, out_dir)
     interni_path = write_interni_file(ordered, out_dir)
+    nesig_path = write_nesigurnosti([records[p.sku] for p in products if p.sku in records],
+                                    out_dir)
 
     from collections import Counter  # noqa: PLC0415
     brojac = Counter(str(r.get("Ukupni status", "")) for r in ordered)
@@ -655,6 +711,7 @@ def main() -> None:
         print(f"PDP datoteke: {pdp_dir}/  (MD + DOCX po proizvodu)")
     print(f"Za klijenta: {klijent_path}")
     print(f"Interno:     {interni_path}")
+    print(f"Nesigurnosti: {nesig_path}")
     print(f"Puni indeks: {xlsx_path}")
     if any(k.startswith(GRESKE) for k in brojac):
         print("Retke s greškom ponovi s: --retry-review (ili --sku <SKU>).")

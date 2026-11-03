@@ -1495,6 +1495,59 @@ def oznake_za_provjeru(md: str) -> list[str]:
             for m in re.finditer(r"\[PROVJERITI(?::\s*([^\]]*))?\]", md)]
 
 
+NESIGURNOST_NEDOSTAJE = "nedostaje obvezan podatak"
+NESIGURNOST_NESLAGANJE = "izvori se ne slažu"
+NESIGURNOST_NEPOTVRDENO = "nepotvrđen podatak"
+
+
+def nesigurnosti(md: str) -> list[dict]:
+    """Svaka oznaka [PROVJERITI: …] s mjestom (odjeljak, redak tablice) i vrstom,
+    za zaseban izvještaj o nesigurnostima (opis za kupca ide bez oznaka)."""
+    out, sekcija = [], ""
+    for redak in md.splitlines():
+        s = redak.strip()
+        m = re.match(r"#{2,3}\s+(.+)", s)
+        if m:
+            sekcija = m.group(1).strip()
+            continue
+        if s.startswith("## Izvori"):
+            break
+        oznake = list(R.PROVJERITI_RE.finditer(s))
+        if not oznake:
+            continue
+        celije = [c.strip() for c in s.strip("|").split("|")] if s.startswith("|") else []
+        redak_tab = R.PROVJERITI_RE.sub(lambda x: x.group(1) or "", celije[0]).strip() \
+            if celije else ""
+        if celije and R.PROVJERITI_RE.fullmatch(celije[0]) and \
+                not "".join(celije[1:]).strip():
+            out.append({"sekcija": sekcija, "polje": redak_tab, "podatak": "",
+                        "vrsta": NESIGURNOST_NEDOSTAJE})
+            continue
+        vrsta = NESIGURNOST_NESLAGANJE if len(oznake) > 1 and " / " in s \
+            else NESIGURNOST_NEPOTVRDENO
+        tekst = R.PROVJERITI_RE.sub(lambda x: x.group(1) or "", s).strip("|- ").strip()
+        for o in oznake:
+            out.append({"sekcija": sekcija, "polje": redak_tab,
+                        "podatak": (o.group(1) or "").strip(), "vrsta": vrsta,
+                        "kontekst": tekst[:240]})
+    return out
+
+
+def bez_oznaka(md: str) -> str:
+    """Opis za kupca bez crvenih oznaka: označena vrijednost ostaje kao običan
+    tekst, a obvezan redak tablice bez vrijednosti se izostavlja."""
+    out = []
+    for redak in md.splitlines():
+        s = redak.strip()
+        if s.startswith("|"):
+            celije = [c.strip() for c in s.strip("|").split("|")]
+            if celije and R.PROVJERITI_RE.fullmatch(celije[0]) and \
+                    not "".join(celije[1:]).strip():
+                continue
+        out.append(R.PROVJERITI_RE.sub(lambda m: (m.group(1) or "").strip(), redak))
+    return "\n".join(out).rstrip() + "\n"
+
+
 # ---------------------------------------------------------------------------
 # Deterministička kontrola
 # ---------------------------------------------------------------------------
