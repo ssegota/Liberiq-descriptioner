@@ -17,17 +17,20 @@ cat > trust.json <<'EOF'
  "Condition":{"StringEquals":{"aws:SourceAccount":"718428650690"},
   "ArnLike":{"aws:SourceArn":"arn:aws:bedrock:eu-central-1:718428650690:model-invocation-job/*"}}}]}
 EOF
-cat > s3.json <<'EOF'
+cat > role.json <<'EOF'
 {"Version":"2012-10-17","Statement":[
  {"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::liberiq/bedrock-batch/*"},
  {"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::liberiq",
-  "Condition":{"StringLike":{"s3:prefix":["bedrock-batch/*"]}}}]}
+  "Condition":{"StringLike":{"s3:prefix":["bedrock-batch/*"]}}},
+ {"Effect":"Allow","Action":"bedrock:InvokeModel","Resource":[
+  "arn:aws:bedrock:eu-central-1:718428650690:inference-profile/eu.anthropic.claude-sonnet-4-6",
+  "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-6*"]}]}
 EOF
 aws iam create-role --role-name liberiq-bedrock-batch \
   --assume-role-policy-document file://trust.json \
   --description "Bedrock batch za Liberiq PDP generator (samo s3://liberiq/bedrock-batch/)"
 aws iam put-role-policy --role-name liberiq-bedrock-batch \
-  --policy-name liberiq-bedrock-batch-s3 --policy-document file://s3.json
+  --policy-name liberiq-bedrock-batch --policy-document file://role.json
 ```
 
 ## 2. Prava za korisnika `liberiq` (pokretanje jobova i ulaz/izlaz u S3)
@@ -36,7 +39,8 @@ aws iam put-role-policy --role-name liberiq-bedrock-batch \
 cat > user.json <<'EOF'
 {"Version":"2012-10-17","Statement":[
  {"Effect":"Allow","Action":["bedrock:CreateModelInvocationJob","bedrock:GetModelInvocationJob",
-   "bedrock:ListModelInvocationJobs","bedrock:StopModelInvocationJob"],"Resource":"*"},
+   "bedrock:ListModelInvocationJobs","bedrock:StopModelInvocationJob",
+   "bedrock:GetInferenceProfile","bedrock:ListInferenceProfiles"],"Resource":"*"},
  {"Effect":"Allow","Action":"iam:PassRole",
   "Resource":"arn:aws:iam::718428650690:role/liberiq-bedrock-batch",
   "Condition":{"StringEquals":{"iam:PassedToService":"bedrock.amazonaws.com"}}},
